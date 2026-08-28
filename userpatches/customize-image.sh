@@ -93,22 +93,36 @@ setup_ssh() {
 		chmod 600 /root/.ssh/authorized_keys
 	fi
 
-	# Host keys are deliberately NOT generated here: baking them into a
-	# published image would give every WS1508 in the world the same host
-	# key. Instead make sure they are generated on first boot.
-	rm -f /etc/ssh/ssh_host_*
-	systemctl enable ssh.service 2>/dev/null || systemctl enable sshd.service 2>/dev/null || true
-	if [ -f /lib/systemd/system/ssh.service ] || [ -f /etc/systemd/system/ssh.service ]; then
-		systemctl enable ssh.service || true
+	# Host keys.
+	#
+	# A published image must not ship host keys that every WS1508 in the
+	# world then shares. Armbian already solves this: armbian-firstrun.service
+	# is enabled at build time and, with OPENSSHD_REGENERATE_HOST_KEYS=true,
+	# deletes and regenerates the host keys on first boot.
+	#
+	# What we must NOT do is delete the keys here. armbian-firstrun.service
+	# declares "After=ssh.service", so on first boot sshd starts BEFORE it --
+	# and Debian's ssh.service runs "sshd -t" as ExecStartPre, which fails
+	# when there is no host key. The image would come up with sshd in a
+	# failed state, which is precisely the outcome this image exists to
+	# avoid. So the build-time keys stay, and firstrun swaps them out
+	# seconds into the first boot.
+	if [ -f /etc/default/armbian-firstrun ]; then
+		sed -i 's/^OPENSSHD_REGENERATE_HOST_KEYS=.*/OPENSSHD_REGENERATE_HOST_KEYS=true/' \
+			/etc/default/armbian-firstrun
 	fi
-	# Debian generates missing host keys via this unit; make sure it runs.
-	systemctl enable ssh-keygen.service 2>/dev/null || true
-	# Belt and braces for images where the keygen unit is absent.
+
+	systemctl enable ssh.service 2>/dev/null || systemctl enable sshd.service 2>/dev/null || true
+
+	# Safety net for the case where the image somehow has no host key at all
+	# (and for Debian trixie, where openssh-server is socket-activated and
+	# ssh.socket can start sshd without ssh.service ever being ordered).
+	# It is a no-op whenever keys are present, which is the normal case.
 	cat > /etc/systemd/system/ws1508-sshd-keygen.service <<-'EOF'
 		[Unit]
-		Description=Generate SSH host keys if missing
-		Before=ssh.service
-		ConditionPathExistsGlob=|!/etc/ssh/ssh_host_*_key
+		Description=Generate SSH host keys if none are present
+		Before=ssh.service ssh.socket
+		ConditionPathExistsGlob=!/etc/ssh/ssh_host_*_key
 
 		[Service]
 		Type=oneshot
