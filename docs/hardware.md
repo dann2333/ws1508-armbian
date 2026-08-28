@@ -140,7 +140,7 @@ try emmc boot        ← 在探测 eMMC
 | USB | `usb0` @ 0xC9040000，OTG |
 | CPU 调压 | PWM_D 上的 `pwm-regulator`，860mV~1140mV |
 | 红灯 | GPIOAO_2，触发器 `default-on`（电源指示） |
-| 绿灯 | GPIOAO_3，触发器 `disk-activity` |
+| 绿灯 | GPIOAO_3，触发器 `mmc1`（**只反映内置 eMMC 读写**；NAND 版或 U 盘启动时不亮） |
 | 蓝灯 | GPIOAO_4，触发器 `heartbeat`（内核活着就闪，没串口时很有用） |
 | 按键 | GPIOAO_5，中断号 5，上报 `KEY_RESTART` |
 

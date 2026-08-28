@@ -27,6 +27,19 @@ mkdir -p "${WORKDIR}" "${UBOOT_OUT}" "${TOOLS}"
 
 clone_pinned "${UBOOT_REPO}" "${UBOOT_COMMIT}" "${UBOOT_SRC}"
 
+# Patches to the shared u-boot tree (as opposed to our own board directory).
+# Kept as patches so it is obvious what upstream code we are changing and why.
+if compgen -G "${REPO_ROOT}/uboot/patches/*.patch" > /dev/null; then
+	for p in "${REPO_ROOT}"/uboot/patches/*.patch; do
+		if patch -p1 -d "${UBOOT_SRC}" -R --dry-run --silent < "${p}" >/dev/null 2>&1; then
+			log "Already applied: $(basename "${p}")"
+		else
+			log "Applying $(basename "${p}")"
+			patch -p1 -d "${UBOOT_SRC}" < "${p}"
+		fi
+	done
+fi
+
 log "Applying the m8b_ws1508 board overlay"
 rm -rf "${UBOOT_SRC}/board/amlogic/m8b_ws1508"
 cp -r "${REPO_ROOT}/uboot/m8b_ws1508" "${UBOOT_SRC}/board/amlogic/"
@@ -109,3 +122,14 @@ if [[ "$(probe_count 'try emmc boot')" -eq 0 ]]; then
 	die "Built bootloader has no eMMC probe. Refusing to publish."
 fi
 log "Verified: bootloader probes both NAND and eMMC"
+
+# CONFIG_CMD_NAND alone is not enough: amlnf_init() refuses to probe while
+# device_boot_flag still says CARD_BOOT_FLAG, which is what
+# get_device_boot_flag() sets just before calling it. uboot/patches fixes
+# the ordering; make sure the fix is actually in this build, because
+# without it NAND units get a "try nand boot" line and nothing else.
+if ! grep -q "device_boot_flag = NAND_BOOT_FLAG;" "${UBOOT_SRC}/arch/arm/lib/board.c" \
+   || [[ "$(grep -c "device_boot_flag = NAND_BOOT_FLAG;" "${UBOOT_SRC}/arch/arm/lib/board.c")" -lt 2 ]]; then
+	die "The NAND probe-ordering patch is not applied - NAND units would not be detected. Refusing to publish."
+fi
+log "Verified: NAND probe-ordering patch is in place"

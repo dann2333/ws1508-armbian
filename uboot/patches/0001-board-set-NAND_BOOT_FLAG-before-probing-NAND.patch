@@ -1,0 +1,47 @@
+Subject: board: set NAND_BOOT_FLAG before probing NAND, not after
+
+get_device_boot_flag() starts by setting the global device_boot_flag to
+CARD_BOOT_FLAG and only assigns NAND_BOOT_FLAG *after* amlnf_init(0x5)
+returns 0. But amlnf_init() begins with get_boot_device()
+(drivers/amlnf/dev/amlnf_dev.c), which reads that very global:
+
+	if(device_boot_flag == CARD_BOOT_FLAG){
+		boot_device_flag = -1;
+		aml_nand_msg("CARD BOOT: not init nand");
+		return -1;
+	}
+
+so amlnf_init() bails out with -1 before amlnf_phy_init() ever runs, and
+the NAND_BOOT_FLAG assignment is unreachable. Enabling CONFIG_CMD_NAND
+alone therefore does not make a raw-NAND board detectable -- it only adds
+a "try nand boot" line to the log followed by "CARD BOOT: not init nand".
+
+Set the flag to NAND_BOOT_FLAG for the duration of the probe and put it
+back if the probe fails, which is what the assignment was reaching for.
+The eMMC branch below needs no equivalent change: emmc_init() does not
+consult device_boot_flag.
+
+Only reachable with CONFIG_CMD_NAND defined, so boards that leave it off
+(the OneCloud among them) are bit-for-bit unaffected.
+
+--- a/arch/arm/lib/board.c
++++ b/arch/arm/lib/board.c
+@@ -560,10 +560,18 @@ void get_device_boot_flag(void)
+ 				return;
+ 
+ 			printf("try nand boot\n");
++			/*
++			 * amlnf_init() -> get_boot_device() reads the global
++			 * device_boot_flag and refuses to touch the NAND while
++			 * it still says CARD_BOOT_FLAG, so claim NAND for the
++			 * duration of the probe and hand it back on failure.
++			 */
++			device_boot_flag = NAND_BOOT_FLAG;
+ 			if(amlnf_init(0x5) == 0) {
+ 				device_boot_flag = NAND_BOOT_FLAG;
+ 				return;
+ 			}
++			device_boot_flag = CARD_BOOT_FLAG;
+ 			failed = true;
+ 		}
+ #endif // CONFIG_CMD_NAND

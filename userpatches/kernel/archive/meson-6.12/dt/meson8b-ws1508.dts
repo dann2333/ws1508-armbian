@@ -98,12 +98,21 @@
 		compatible = "gpio-leds";
 
 		/*
-		 * Triggers are chosen for a headless box that may root from
-		 * eMMC, SD or USB:
+		 * Triggers for a headless box:
 		 *   red   - power / "board is up"
-		 *   green - activity on whichever block device is in use
+		 *   green - eMMC activity
 		 *   blue  - kernel heartbeat, so a hung kernel is visible
 		 *           without a serial cable
+		 *
+		 * Note on green: the obvious-looking "disk-activity" trigger is
+		 * useless here. In v6.12 the only caller of
+		 * ledtrig_disk_activity() is drivers/ata/libata-core.c, and
+		 * meson8b has no ATA controller, so the LED would bind to the
+		 * trigger and then never blink. "mmc1" is a real trigger,
+		 * registered by mmc_add_host() from the mmc alias below, and it
+		 * does pulse -- but only for the internal eMMC. On a raw-NAND
+		 * unit, or one running from a USB stick, the green LED stays
+		 * dark. That is honest: it means "internal storage is busy".
 		 */
 		led-red {
 			label = "ws1508:red:power";
@@ -113,10 +122,10 @@
 		};
 
 		led-green {
-			label = "ws1508:green:disk";
+			label = "ws1508:green:emmc";
 			gpios = <&gpio_ao GPIOAO_3 GPIO_ACTIVE_HIGH>;
 			default-state = "off";
-			linux,default-trigger = "disk-activity";
+			linux,default-trigger = "mmc1";
 		};
 
 		led-blue {
@@ -440,10 +449,20 @@
 };
 
 /*
- * The single USB 2.0 port. It doubles as the Amlogic USB burning port,
- * so it is left in OTG mode: with nothing driving the ID pin the
- * controller settles into host mode and USB mass storage works, while
- * the ROM/u-boot can still use it in device mode for flashing.
+ * The single USB 2.0 port, which doubles as the Amlogic USB burning port.
+ *
+ * The port ends up host-only under Linux, which is what we want for USB
+ * mass storage; flashing happens from the ROM and u-boot, before Linux is
+ * running, so nothing here needs gadget mode.
+ *
+ * The dr_mode below is inherited from the community DTS and is inert:
+ * of_usb_get_dr_mode_by_phy() reads dr_mode from the *controller* node
+ * that references the phy, never from the phy node itself, and
+ * meson.dtsi already sets dr_mode = "host" on usb0. It is kept rather
+ * than "corrected" onto &usb0 on purpose -- doing that would send
+ * phy_meson8b_usb2_power_on() down its OTG path and skip the IDDQ clear
+ * and ACA handling that the host path performs, which is a real
+ * behaviour change and not the cleanup it looks like.
  */
 &usb0_phy {
 	status = "okay";

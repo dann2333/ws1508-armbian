@@ -78,7 +78,50 @@ try nand boot
 
 `scripts/build-uboot.sh` 会做这个检查，缺任何一个就拒绝出包。
 
-### 2. 启动顺序
+### 2. `CONFIG_CMD_NAND` 本身还不够
+
+只开这个宏还是不行 —— 这一点是代码审查抓出来的，我一开始漏了。
+`get_device_boot_flag()` 是这么写的：
+
+```c
+device_boot_flag = CARD_BOOT_FLAG;     // ← 先设成 CARD
+...
+    if(amlnf_init(0x5) == 0) {
+        device_boot_flag = NAND_BOOT_FLAG;   // ← 想在成功后再设成 NAND
+```
+
+而 `amlnf_init()` 第一件事就是 `get_boot_device()`
+（`drivers/amlnf/dev/amlnf_dev.c`），它读的正是这个全局变量：
+
+```c
+if(device_boot_flag == CARD_BOOT_FLAG){
+    boot_device_flag = -1;
+    aml_nand_msg("CARD BOOT: not init nand");
+    return -1;
+}
+```
+
+于是 `amlnf_init()` 在真正碰 NAND 之前就返回 -1，那句
+`device_boot_flag = NAND_BOOT_FLAG` **永远执行不到**。表现是串口打出
+`try nand boot` 紧接着 `CARD BOOT: not init nand`，然后什么都没发生。
+
+`uboot/patches/0001-board-set-NAND_BOOT_FLAG-before-probing-NAND.patch`
+把顺序改过来：探测前先认领 `NAND_BOOT_FLAG`，失败再还回 `CARD_BOOT_FLAG`。
+eMMC 那一支不用改，`emmc_init()` 不看这个变量（这也是为什么玩客云一直没事）。
+
+反汇编可以验证补丁生效（`mov r6,#1` 存进去，然后才 `bl amlnf_init`）：
+
+```console
+$ arm-none-eabi-objdump -d build/arch/arm/lib/board.o | sed -n '/<get_device_boot_flag>:/,/^$/p'
+ 11c: mov r3, #3     ← 初始 CARD_BOOT_FLAG
+ 1b8: mov r6, #1     ← NAND_BOOT_FLAG，补丁加的
+ 1c0: mov r0, #5     ← amlnf_init(0x5)
+ 1dc: mov r3, #3     ← 失败还回 CARD_BOOT_FLAG
+```
+
+`scripts/build-uboot.sh` 会检查补丁是否在位，不在就拒绝出包。
+
+### 3. 启动顺序
 
 玩客云的 `CONFIG_BOOTCOMMAND` 只有 `run boot_emmc_armbian`，
 NAND 机器无路可走。本项目改成 `usb → sd → emmc`，
@@ -117,7 +160,7 @@ WS1508（单颗 x16，512MB）实测落在 `16 bit mode lane0+1` + `512MB`，
 |---|---|
 | `memory` 节点 1GB → 512MB | 原版是从玩客云复制时漏改的，见 `hardware.md` |
 | `memory` 基址 `0x40000000` → `0x00000000` | 所有主线 meson8b 板子都写 0x40000000，但那个值从来没生效过（引导总会重写）。真实基址是 0，见下 |
-| LED 触发器换成 `default-on` / `disk-activity` / `heartbeat` | 原版绿灯绑死 `mmc1`，从 U 盘启动时永远不亮；`heartbeat` 让没串口时也能看出内核死没死 |
+| 蓝灯触发器换成 `heartbeat` | 原版是 `usb-host`；`heartbeat` 让没串口时也能看出内核死没死 |
 | 去掉 `RTL8211F` 注释 | 那是玩客云的千兆 PHY，WS1508 是 RMII 百兆，注释会误导人 |
 
 保留不动的：RMII 网口配置、`&sdhc` eMMC、`&sdio` SD 卡槽、
@@ -188,7 +231,7 @@ U-Boot 的 `dram_init_banksize()` 拿它填 `gd->bd->bi_dram[0].start`，
 
 | 脚本 | 检查 |
 |---|---|
-| `build-uboot.sh` | 编出来的 U-Boot 里同时有 `try nand boot` 和 `try emmc boot` |
+| `build-uboot.sh` | 编出来的 U-Boot 里同时有 `try nand boot` 和 `try emmc boot`；NAND 探测顺序补丁在位 |
 | `build-armbian.sh` | 镜像 boot 分区里有 `dtb/meson8b-ws1508.dtb`、`boot.scr` 和 `uInitrd`（启动脚本无条件加载 uInitrd，缺了就起不来） |
 | `make-burn-image.sh` | 打好的 burn 包能被 AmlImg 原样解回来，且 5 个必需成员齐全 |
 
