@@ -197,29 +197,44 @@ dtb 会**悄无声息地**从镜像里消失。`scripts/build-armbian.sh` 会检
 ## 加载地址：512MB 板子最容易踩的雷
 
 `boot-ws1508.cmd` 一开始是照抄 Armbian 的 `boot-onecloud.cmd` 的，
-它把 uImage / dtb / uInitrd 分别加载到 `0x20800000` / `0x21800000` / `0x22000000`。
-玩客云有 1GB，这三个地址（520 / 536 / 544 MB）都在内存里，没问题。
-**WS1508 只有 512MB，内存到 `0x20000000` 就结束了 —— 这三个地址全在内存外面，
-机器根本起不来。**
+它把 `armbianEnv.txt` / uImage / dtb / uInitrd 加载到
+`0x20800000` / `0x21800000` / `0x22000000`。
+玩客云有 1GB，这些地址（520~544MB）都在内存里，没问题。
+**WS1508 只有 512MB，内存到 `0x20000000` 就结束了。**
 
-DRAM 基址是 `0x00000000`，不是设备树里写的 `0x40000000`。依据：
+而且后果比"地址没有内存"更直接：`CONFIG_ACS` 会让 `dram_init()` 调用
+`update_ddr_mmu_table()`，它按运行期实测出来的容量
+（`CONFIG_DDR_SIZE_IND_ADDR` 里的 512）把**超出部分每个 1MB 段的一级页表项清零**。
+U-Boot 此时 MMU 是开着的（`cpu_init_crit` → `cache_init` 无条件置位 SCTLR.M），
+所以往 `0x20800000` 写就是**翻译错误 → data abort → U-Boot 直接挂掉**。
+第一个踩雷的其实是 `armbianEnv.txt` 那一行，内核都还没轮到。
+
+（注意：这跟我改的 `PHYS_MEMORY_SIZE` 无关。开了
+`CONFIG_DDR_SIZE_AUTO_DETECT` 之后 `cpu.h` 会 `#undef CONFIG_MMU_DDR_SIZE`
+并强制成 2GB，页表是运行期按实测容量裁的。）
+
+DRAM 基址是 `0x00000000`，不是设备树里写的 `0x40000000`：
 `arch/arm/include/asm/arch-m8b/cpu.h` 里 `CONFIG_SYS_SDRAM_BASE 0x00000000`，
-U-Boot 的 `dram_init_banksize()` 拿它填 `gd->bd->bi_dram[0].start`，
+`dram_init_banksize()` 拿它填 `gd->bd->bi_dram[0].start`，
 再由 `fdt_fixup_memory_banks()` 写进设备树。
-`meson8b.dtsi` 里 `hwrom@0` 这个保留区、以及所有 S805 启动脚本用的内核加载地址
-（OpenWrt 用 `0x00108000`，Armbian meson 家族 `SRC_LOADADDR=0x00208000`）
-也都印证基址是 0。
 
-现在的布局，全部落在 512MB 以内，并且避开 U-Boot 自己
-（`CONFIG_SYS_TEXT_BASE = 0x10000000`，往上还有 12MB malloc 区）：
+低 512MB 里已经有主的区域：
+
+| 地址 | 占用者 |
+|---|---|
+| `0x10000000` (256MB) | U-Boot 自己（`CONFIG_SYS_TEXT_BASE`）+ 12MB malloc |
+| `0x12000000` (288MB) | `${loadaddr}`：`boot.scr` 本体，脚本跑完之前一直在用 |
+| `0x13000000` (304MB) | `${loadaddr_logo}`，`imgread pic resource` 用 |
+| `0x15100000` (337MB) | `${fb_addr}`，framebuffer（1280x720x24 约 2.7MB） |
+
+所以现在的布局全部避开它们：
 
 | 地址 | 用途 |
 |---|---|
 | `0x11000000` (272MB) | `armbianEnv.txt` 暂存 |
-| `0x12000000` (288MB) | `boot.scr` —— U-Boot 环境里的 `loadaddr`，**别往这儿加载别的东西** |
-| `0x13000000` (304MB) | `uImage`，留了 48MB |
-| `0x16000000` (352MB) | `dtb` |
-| `0x16800000` (360MB) | `uInitrd`，下面还有 152MB 可用 |
+| `0x16000000` (352MB) | `uImage`，留了 64MB |
+| `0x1a000000` (416MB) | `dtb` |
+| `0x1a800000` (424MB) | `uInitrd`，下面还有约 88MB |
 
 移植到其它内存更小的 S805 板子时，这是第一个要改的地方。
 

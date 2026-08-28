@@ -73,26 +73,32 @@ setenv bootargs "${bootargs} ${extraargs}"
 # has 512MB, so anything at or above 0x20000000 is past the end of RAM.
 # The OneCloud script these addresses came from uses 0x20800000 /
 # 0x21800000 / 0x22000000, which is fine on its 1GB but lands in thin air
-# here. Everything below stays under 0x20000000, and clear of u-boot
-# itself, which runs at CONFIG_SYS_TEXT_BASE 0x10000000 with a 12MB
-# malloc arena above it.
+# here -- and not merely "unbacked": update_ddr_mmu_table() zeroes the
+# first-level descriptor for every 1MB section beyond the auto-detected
+# size, so a load there takes a translation fault and u-boot dies.
 #
-#   0x11000000 (272MB)  armbianEnv.txt scratch
-#   0x12000000 (288MB)  boot.scr -- this very script, loaded by u-boot at
-#                       ${loadaddr}; nothing below may be loaded onto it
-#   0x13000000 (304MB)  uImage        -- 48MB of headroom
-#   0x16000000 (352MB)  dtb
-#   0x16800000 (360MB)  uInitrd       -- 152MB left below the 512MB mark
+# Four regions in the low 512MB are already spoken for by u-boot's own
+# environment, so the loads below step around them:
+#   0x10000000 (256MB)  u-boot itself (CONFIG_SYS_TEXT_BASE) + 12MB malloc
+#   0x12000000 (288MB)  ${loadaddr}: boot.scr, i.e. THIS script, still
+#                       executing out of that buffer for as long as it runs
+#   0x13000000 (304MB)  ${loadaddr_logo}, used by "imgread pic resource"
+#   0x15100000 (337MB)  ${fb_addr}, the framebuffer (~2.7MB at 1280x720x24)
+#
+#   0x11000000 (272MB)  armbianEnv.txt scratch (small, read once)
+#   0x16000000 (352MB)  uImage        -- 64MB of headroom, clear of fb_addr
+#   0x1a000000 (416MB)  dtb
+#   0x1a800000 (424MB)  uInitrd       -- ~88MB left below the 512MB mark
 #
 # bootm then relocates the kernel down to the load address in the uImage
 # header (Armbian builds meson with LOADADDR=0x00208000) and moves the
 # fdt/initrd within the bootmap, which CONFIG_SYS_BOOTMAPSZ caps at the
 # real 512MB.
-fatload ${bootdev} 0x13000000 /uImage || exit 1
-fatload ${bootdev} 0x16800000 /uInitrd || exit 1
-fatload ${bootdev} 0x16000000 /dtb/meson8b-ws1508.dtb || exit 1
+fatload ${bootdev} 0x16000000 /uImage || exit 1
+fatload ${bootdev} 0x1a800000 /uInitrd || exit 1
+fatload ${bootdev} 0x1a000000 /dtb/meson8b-ws1508.dtb || exit 1
 
-bootm 0x13000000 0x16800000 0x16000000
+bootm 0x16000000 0x1a800000 0x1a000000
 
 # Recompile with:
 # mkimage -C none -A arm -T script -d /boot/boot.cmd /boot/boot.scr
