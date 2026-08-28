@@ -74,9 +74,23 @@ clone_pinned() {
 	git -C "${dir}" remote add origin "${url}"
 	# Try to fetch just the pinned commit; fall back to a full fetch for
 	# servers that do not allow fetching an arbitrary SHA.
-	if ! git -C "${dir}" fetch -q --depth 1 origin "${commit}" 2>/dev/null; then
-		warn "Server refused single-commit fetch, falling back to full fetch"
-		git -C "${dir}" fetch -q origin
+	#
+	# The two cases need different checkouts. After a single-commit fetch
+	# FETCH_HEAD *is* the commit. After a bare "git fetch origin" it is the
+	# remote's default-branch tip, which is emphatically not what we pinned
+	# -- checking that out would silently build whatever upstream happens to
+	# be at today, which for a bootloader is exactly the drift the pin
+	# exists to prevent.
+	if git -C "${dir}" fetch -q --depth 1 origin "${commit}" 2>/dev/null; then
+		git -C "${dir}" checkout -q FETCH_HEAD
+	else
+		warn "Server refused single-commit fetch, falling back to a full fetch"
+		git -C "${dir}" fetch -q origin '+refs/heads/*:refs/remotes/origin/*'
+		git -C "${dir}" checkout -q "${commit}"
 	fi
-	git -C "${dir}" checkout -q FETCH_HEAD 2>/dev/null || git -C "${dir}" checkout -q "${commit}"
+
+	local got
+	got="$(git -C "${dir}" rev-parse HEAD)"
+	[[ "${got}" == "${commit}" ]] \
+		|| die "Checked out ${got} but expected the pinned ${commit} in ${dir}"
 }

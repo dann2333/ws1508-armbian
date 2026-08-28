@@ -119,18 +119,51 @@ ls -la "${OUTDIR}/images" 2>/dev/null || true
 # loads /dtb/meson8b-ws1508.dtb unconditionally. Catch that here rather
 # than after somebody flashes it.
 if [[ "${MODE}" == "build" ]]; then
-	img="$(ls "${OUTDIR}"/images/*.img 2>/dev/null | head -1 || true)"
+	# Pick the raw Armbian image, not a *.burn.img left over from an
+	# earlier run in the same output directory -- that also matches *.img,
+	# sorts first, and is not a partitioned disk image, so mounting it
+	# would fail and abort a perfectly good build.
+	img=""
+	shopt -s nullglob
+	for f in "${OUTDIR}"/images/*.img; do
+		case "${f}" in *.burn.img) continue ;; esac
+		img="${f}"
+		break
+	done
+	shopt -u nullglob
+
 	if [[ -n "${img}" ]]; then
 		log "Verifying the image contains meson8b-ws1508.dtb"
-		loop="$(losetup --find --show --partscan "${img}")"
+		# Attach the boot partition by explicit offset rather than with
+		# --partscan: the /dev/loopNpM nodes it relies on come from udev,
+		# which is absent in many build containers, and there the mount
+		# below would fail for a reason that has nothing to do with the
+		# image. Offsets come from the MBR, same as make-burn-image.sh.
+		start_lba="$(python3 - "${img}" <<-'PY'
+			import struct, sys
+			with open(sys.argv[1], 'rb') as f:
+			    mbr = f.read(512)
+			if mbr[510:512] != b'\x55\xaa':
+			    sys.exit('not an MBR-partitioned image')
+			e = mbr[446:462]
+			start, sectors = struct.unpack_from('<II', e, 8)
+			if e[4] == 0 or not sectors:
+			    sys.exit('no first partition')
+			print(start)
+		PY
+		)" || die "Cannot read the partition table of ${img}: ${start_lba}"
+
+		loop="$(losetup --find --show --offset "$((start_lba * 512))" "${img}")"
 		mnt="$(mktemp -d)"
 		trap 'umount "${mnt}" 2>/dev/null || true; losetup -d "${loop}" 2>/dev/null || true' EXIT
-		mount "${loop}p1" "${mnt}"
+		mount -o ro "${loop}" "${mnt}"
 		[[ -f "${mnt}/dtb/meson8b-ws1508.dtb" ]] \
 			|| die "Image is missing /dtb/meson8b-ws1508.dtb - the DT autopatcher did not run. Refusing to publish."
 		[[ -f "${mnt}/boot.scr" ]] \
 			|| die "Image is missing /boot.scr - the bootloader would find nothing to run."
-		log "Verified: meson8b-ws1508.dtb and boot.scr are present in the boot partition"
+		[[ -f "${mnt}/uInitrd" ]] \
+			|| die "Image is missing /uInitrd - boot-ws1508.cmd loads it unconditionally and would abort."
+		log "Verified: meson8b-ws1508.dtb, boot.scr and uInitrd are present in the boot partition"
 		umount "${mnt}"
 		losetup -d "${loop}"
 		trap - EXIT

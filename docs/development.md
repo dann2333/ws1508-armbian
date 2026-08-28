@@ -116,6 +116,7 @@ WS1508（单颗 x16，512MB）实测落在 `16 bit mode lane0+1` + `512MB`，
 | 改动 | 原因 |
 |---|---|
 | `memory` 节点 1GB → 512MB | 原版是从玩客云复制时漏改的，见 `hardware.md` |
+| `memory` 基址 `0x40000000` → `0x00000000` | 所有主线 meson8b 板子都写 0x40000000，但那个值从来没生效过（引导总会重写）。真实基址是 0，见下 |
 | LED 触发器换成 `default-on` / `disk-activity` / `heartbeat` | 原版绿灯绑死 `mmc1`，从 U 盘启动时永远不亮；`heartbeat` 让没串口时也能看出内核死没死 |
 | 去掉 `RTL8211F` 注释 | 那是玩客云的千兆 PHY，WS1508 是 RMII 百兆，注释会误导人 |
 
@@ -150,6 +151,37 @@ dtb 会**悄无声息地**从镜像里消失。`scripts/build-armbian.sh` 会检
 
 ---
 
+## 加载地址：512MB 板子最容易踩的雷
+
+`boot-ws1508.cmd` 一开始是照抄 Armbian 的 `boot-onecloud.cmd` 的，
+它把 uImage / dtb / uInitrd 分别加载到 `0x20800000` / `0x21800000` / `0x22000000`。
+玩客云有 1GB，这三个地址（520 / 536 / 544 MB）都在内存里，没问题。
+**WS1508 只有 512MB，内存到 `0x20000000` 就结束了 —— 这三个地址全在内存外面，
+机器根本起不来。**
+
+DRAM 基址是 `0x00000000`，不是设备树里写的 `0x40000000`。依据：
+`arch/arm/include/asm/arch-m8b/cpu.h` 里 `CONFIG_SYS_SDRAM_BASE 0x00000000`，
+U-Boot 的 `dram_init_banksize()` 拿它填 `gd->bd->bi_dram[0].start`，
+再由 `fdt_fixup_memory_banks()` 写进设备树。
+`meson8b.dtsi` 里 `hwrom@0` 这个保留区、以及所有 S805 启动脚本用的内核加载地址
+（OpenWrt 用 `0x00108000`，Armbian meson 家族 `SRC_LOADADDR=0x00208000`）
+也都印证基址是 0。
+
+现在的布局，全部落在 512MB 以内，并且避开 U-Boot 自己
+（`CONFIG_SYS_TEXT_BASE = 0x10000000`，往上还有 12MB malloc 区）：
+
+| 地址 | 用途 |
+|---|---|
+| `0x11000000` (272MB) | `armbianEnv.txt` 暂存 |
+| `0x12000000` (288MB) | `boot.scr` —— U-Boot 环境里的 `loadaddr`，**别往这儿加载别的东西** |
+| `0x13000000` (304MB) | `uImage`，留了 48MB |
+| `0x16000000` (352MB) | `dtb` |
+| `0x16800000` (360MB) | `uInitrd`，下面还有 152MB 可用 |
+
+移植到其它内存更小的 S805 板子时，这是第一个要改的地方。
+
+---
+
 ## 镜像里做的验证
 
 出错要在构建期炸掉，不能等用户刷进去才发现：
@@ -157,7 +189,7 @@ dtb 会**悄无声息地**从镜像里消失。`scripts/build-armbian.sh` 会检
 | 脚本 | 检查 |
 |---|---|
 | `build-uboot.sh` | 编出来的 U-Boot 里同时有 `try nand boot` 和 `try emmc boot` |
-| `build-armbian.sh` | 镜像 boot 分区里有 `dtb/meson8b-ws1508.dtb` 和 `boot.scr` |
+| `build-armbian.sh` | 镜像 boot 分区里有 `dtb/meson8b-ws1508.dtb`、`boot.scr` 和 `uInitrd`（启动脚本无条件加载 uInitrd，缺了就起不来） |
 | `make-burn-image.sh` | 打好的 burn 包能被 AmlImg 原样解回来，且 5 个必需成员齐全 |
 
 ---
@@ -183,6 +215,32 @@ Armbian 用 `chroot ... /usr/bin/env bash -c` 调 `customize-image.sh`，
 环境变量能不能传过去属于实现细节。改成写
 `userpatches/overlay/ws1508-build.conf`，Armbian 会把 `userpatches/overlay`
 绑定挂载到 chroot 里的 `/tmp/overlay`，这是有文档保证的通道。
+
+---
+
+## eMMC 直刷：一个没能静态确认的环节
+
+`.burn.img` 把 Armbian 镜像的 p1 / p2 写进 U-Boot 分区表里的 `boot` / `rootfs`
+两个分区，但**没有**写 LBA 0 的 MBR（那块地方属于 `bootloader` 分区）。
+
+而 U-Boot 这边，`fatload mmc 1 ...` 的解析路径是
+`fat_register_device()`（`fs/fat/fat.c`）：它先读第 0 扇区，检查 0x55AA 签名，
+再走 `get_partition_info()` → `get_partition_info_dos()`。本板只开了
+`CONFIG_DOS_PARTITION`，`disk/part.c` 里也没有 Amlogic 的特殊分支，
+`mmc_bread()` 也没有给块地址加任何基址偏移。
+
+照这个链路推，eMMC 上没有 MBR 的话 `fatload mmc 1` 应该找不到分区。
+但玩客云那边**同样的流水线**（hzyitc / suwei8 / lunatickochiya，都是
+`img2simg p1/p2` + `PARTITION:boot` / `PARTITION:rootfs`，U-Boot 默认环境也是
+`fatload mmc 1 boot.scr`）是公认能从 eMMC 启动的。也就是说这中间还有一环
+我没能只靠读代码确认 —— 大概率是烧录工具写 `bootloader` 分区时的实际落盘位置，
+和我推断的分区偏移不一样。
+
+**对使用者的意义**：eMMC 版第一次刷完如果起不来，接串口看。如果看到
+`** Partition 1 not valid on device 1 **` 或 `fatload` 失败，就是这个原因，
+此时的绕行办法是：插 U 盘启动，然后手工给 eMMC 写一个 MBR（p1 从 16MiB 起、
+256MiB 大小、类型 c；p2 接在后面、类型 83），再重启。请把结果反馈回来，
+确认后我会把这一步固化进构建流程。
 
 ---
 

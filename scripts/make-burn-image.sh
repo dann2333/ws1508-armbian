@@ -84,18 +84,22 @@ declare -a LOOPS=()
 cleanup() { for l in "${LOOPS[@]:-}"; do [[ -n "${l}" ]] && losetup -d "${l}" 2>/dev/null || true; done; }
 trap cleanup EXIT
 
-attach_part() { # $1 = partition number -> echoes the loop device
-	local n="$1" geom start size dev
+# Sets ATTACHED_LOOP. Deliberately NOT "echo the device and capture it with
+# $(...)": command substitution runs in a subshell, so the LOOPS+=() inside
+# would be lost and the cleanup trap would have nothing to release -- the
+# loop devices would leak on every failure until the host runs out of them.
+ATTACHED_LOOP=""
+attach_part() { # $1 = partition number
+	local n="$1" geom start size
 	geom="$(part_geometry "${n}")" || die "Cannot read partition ${n} of ${DISKIMG}: ${geom}"
 	start="${geom% *}"
 	size="${geom#* }"
-	dev="$(losetup --find --show --offset "$((start * SECTOR))" --sizelimit "$((size * SECTOR))" "${DISKIMG}")"
-	LOOPS+=("${dev}")
-	echo "${dev}"
+	ATTACHED_LOOP="$(losetup --find --show --offset "$((start * SECTOR))" --sizelimit "$((size * SECTOR))" "${DISKIMG}")"
+	LOOPS+=("${ATTACHED_LOOP}")
 }
 
-BOOT_LOOP="$(attach_part 1)"
-ROOT_LOOP="$(attach_part 2)"
+attach_part 1; BOOT_LOOP="${ATTACHED_LOOP}"
+attach_part 2; ROOT_LOOP="${ATTACHED_LOOP}"
 log "boot partition -> ${BOOT_LOOP}, root partition -> ${ROOT_LOOP}"
 
 img2simg "${BOOT_LOOP}" "${BURN}/boot.simg"

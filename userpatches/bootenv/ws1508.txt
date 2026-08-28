@@ -22,9 +22,12 @@ console="both"
 # extraargs:
 #   Extra kernel command line arguments.
 #   The WS1508 has only 512MB of RAM, so the image ships with zram swap
-#   enabled (see /etc/default/armbian-zram-config). If you would rather
-#   have no swap at all, add "zswap.enabled=0" here and disable the
-#   armbian-zram-config service.
+#   enabled. That is configured entirely in userspace by
+#   /etc/default/armbian-zram-config -- there is no kernel command line
+#   switch for it, so set ENABLED=false there (or mask
+#   armbian-zram-config.service) if you want no swap. In particular
+#   "zswap.enabled=0" does NOT turn it off: zswap is a different,
+#   unrelated mechanism that this image does not use.
 # extraargs=""
 
 # The following contents are auto-generated.

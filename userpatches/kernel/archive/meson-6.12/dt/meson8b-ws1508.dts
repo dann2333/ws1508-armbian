@@ -56,8 +56,20 @@
 	 */
 	memory {
 		device_type = "memory";
-		/* 512MB - overwritten by u-boot's memory-node fixup */
-		reg = <0x40000000 0x20000000>;
+		/*
+		 * 512MB at 0x0.
+		 *
+		 * Every in-tree meson8b board file says 0x40000000 instead.
+		 * That base is vestigial: it is never used, because the
+		 * Amlogic bootloader always rewrites this node before Linux
+		 * runs. The real base is 0x0 -- the vendor u-boot sets
+		 * gd->bd->bi_dram[0].start from CONFIG_SYS_SDRAM_BASE, which
+		 * arch/arm/include/asm/arch-m8b/cpu.h defines as 0x00000000,
+		 * and that is the value fdt_fixup_memory_banks() writes here.
+		 * meson8b.dtsi's hwrom@0 reserved region agrees, as do the
+		 * kernel load addresses every S805 boot script uses.
+		 */
+		reg = <0x00000000 0x20000000>;
 	};
 
 	emmc_pwrseq: emmc-pwrseq {

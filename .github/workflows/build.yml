@@ -18,8 +18,11 @@ on:
         default: 'current'
         type: choice
         options:
-          - current     # 6.12.x, the only branch the meson family pins
-          - edge
+          # 'current' is the only option on purpose: Armbian's meson family
+          # (config/sources/families/include/meson_common.inc) sets
+          # KERNELBRANCH for the 'current' case alone, so asking for 'edge'
+          # leaves it unset and the build fails partway through.
+          - current
       build_type:
         description: 'Image size'
         required: true
@@ -54,6 +57,13 @@ on:
 
 permissions:
   contents: write
+
+# One image build at a time per branch. A full run takes over an hour, so
+# without this a quick series of pushes stacks several of them on top of
+# each other and the earlier ones are pure waste.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   TZ: Asia/Shanghai

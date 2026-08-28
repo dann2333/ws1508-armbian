@@ -18,22 +18,22 @@ if test -n "${bootdev}"; test $? != 0; then
 	echo 'Boot from usb:'
 	echo '  setenv bootdev "usb 0"'
 	echo '  usb start'
-	echo '  fatload ${bootdev} 0x20800000 boot.scr && autoscr 0x20800000'
+	echo '  fatload ${bootdev} 0x12000000 boot.scr && autoscr 0x12000000'
 	echo ''
 	echo 'Boot from SD card:'
 	echo '  setenv bootdev "mmc 0"'
-	echo '  fatload ${bootdev} 0x20800000 boot.scr && autoscr 0x20800000'
+	echo '  fatload ${bootdev} 0x12000000 boot.scr && autoscr 0x12000000'
 	echo ''
 	echo 'Boot from eMMC:'
 	echo '  setenv bootdev "mmc 1"'
-	echo '  fatload ${bootdev} 0x20800000 boot.scr && autoscr 0x20800000'
+	echo '  fatload ${bootdev} 0x12000000 boot.scr && autoscr 0x12000000'
 	echo '=============================================================='
 	exit 22
 fi
 
 echo "Try to boot from ${bootdev}"
 
-fatload ${bootdev} 0x20800000 /armbianEnv.txt && env import -t 0x20800000 ${filesize}
+fatload ${bootdev} 0x11000000 /armbianEnv.txt && env import -t 0x11000000 ${filesize}
 
 if test -n "${rootdev}"; test $? != 0; then
 	echo 'Please set "rootdev" before calling this script'
@@ -67,12 +67,32 @@ setenv bootargs "${bootargs} root=${rootdev} rootwait rw"
 setenv bootargs "${bootargs} ${consoleargs}"
 setenv bootargs "${bootargs} ${extraargs}"
 
-# Booting
-fatload ${bootdev} 0x20800000 /uImage || exit 1
-fatload ${bootdev} 0x22000000 /uInitrd || exit 1
-fatload ${bootdev} 0x21800000 /dtb/meson8b-ws1508.dtb || exit 1
+# Booting.
+#
+# Load addresses matter on this board. DRAM starts at 0x0 and the WS1508
+# has 512MB, so anything at or above 0x20000000 is past the end of RAM.
+# The OneCloud script these addresses came from uses 0x20800000 /
+# 0x21800000 / 0x22000000, which is fine on its 1GB but lands in thin air
+# here. Everything below stays under 0x20000000, and clear of u-boot
+# itself, which runs at CONFIG_SYS_TEXT_BASE 0x10000000 with a 12MB
+# malloc arena above it.
+#
+#   0x11000000 (272MB)  armbianEnv.txt scratch
+#   0x12000000 (288MB)  boot.scr -- this very script, loaded by u-boot at
+#                       ${loadaddr}; nothing below may be loaded onto it
+#   0x13000000 (304MB)  uImage        -- 48MB of headroom
+#   0x16000000 (352MB)  dtb
+#   0x16800000 (360MB)  uInitrd       -- 152MB left below the 512MB mark
+#
+# bootm then relocates the kernel down to the load address in the uImage
+# header (Armbian builds meson with LOADADDR=0x00208000) and moves the
+# fdt/initrd within the bootmap, which CONFIG_SYS_BOOTMAPSZ caps at the
+# real 512MB.
+fatload ${bootdev} 0x13000000 /uImage || exit 1
+fatload ${bootdev} 0x16800000 /uInitrd || exit 1
+fatload ${bootdev} 0x16000000 /dtb/meson8b-ws1508.dtb || exit 1
 
-bootm 0x20800000 0x22000000 0x21800000
+bootm 0x13000000 0x16800000 0x16000000
 
 # Recompile with:
 # mkimage -C none -A arm -T script -d /boot/boot.cmd /boot/boot.scr

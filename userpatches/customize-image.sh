@@ -59,6 +59,22 @@ setup_ssh() {
 	# instead.
 	rm -f /root/.not_logged_in_yet
 
+	# Armbian's build installs agetty overrides that log root in with no
+	# password on tty1 and on EVERY serial console, so that the first-login
+	# wizard can run without credentials:
+	#
+	#   ExecStart=-/sbin/agetty --noissue --autologin root %I $TERM
+	#
+	# armbian-firstlogin deletes them when it finishes -- and we just
+	# removed the marker that makes it run. Left in place they would mean
+	# anyone who clips a USB-TTL adapter onto the WS1508's four serial pads
+	# gets a root shell, no password asked, forever. Delete them here, the
+	# same files the wizard would have.
+	rm -f /etc/systemd/system/getty@tty1.service.d/override.conf
+	rm -f /etc/systemd/system/getty@.service.d/override.conf
+	rm -f /etc/systemd/system/serial-getty@.service.d/override.conf
+	rm -f /etc/systemd/system/serial-getty@ttyGS0.service.d/override.conf
+
 	# The wizard would normally chmod +x these; do it ourselves so the
 	# login banner still works.
 	chmod +x /etc/update-motd.d/* 2>/dev/null || true

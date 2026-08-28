@@ -11,6 +11,8 @@
 | 网口 | 100Mbps，RMII 接口，PHY 复位接 GPIOH_4 | 设备树 / OpenWrt 移植 |
 | USB | USB 2.0 × 1，OTG | 官方规格 |
 | 无线 | 无 | 官方规格 |
+| 显示输出 | **无**（主板不带 HDMI） | 拆机 / 社区反馈 |
+| TF 卡槽 | **无**（一代有，二代砍掉了） | 社区反馈 |
 | 指示灯 | 红 GPIOAO_2 / 绿 GPIOAO_3 / 蓝 GPIOAO_4 | 设备树 |
 | 按键 | 1 个，GPIOAO_5 | 设备树 |
 | 电源 | 12V / 1A | 官方规格 |
@@ -78,7 +80,8 @@ dmesg | grep -i mmc
 ```
 
 - 能看到 **`/dev/mmcblk1`**（约 3.6GiB）→ **eMMC 版**
-- 只有 `mmcblk0`（SD 卡）或什么都没有 → **NAND 版**
+- 一个 `mmcblk*` 都没有 → **NAND 版**（这机器没有 TF 卡槽，所以正常情况下
+  `mmcblk0` 本来就不存在，能出现的只有 eMMC 的 `mmcblk1`）
 
 > 注意：主线内核没有 meson8b 的 NAND 驱动，所以 NAND 版机器上
 > **不会**出现 `/dev/mtd*`，看不到不等于没有闪存。
@@ -115,8 +118,13 @@ try emmc boot        ← 在探测 eMMC
 **3.3V 电平**，波特率 **115200 8N1**。VCC 那根**不要接**，
 设备自己有 12V 供电，只接 GND / TX / RX 三根。
 
-内核里串口是 `ttyAML0`。镜像默认 `console="both"`（HDMI + 串口），
-可以在 `/boot/armbianEnv.txt` 里改成 `console="serial"`。
+内核里串口是 `ttyAML0`。镜像默认 `console="both"`，由于 Armbian 的启动脚本
+把串口放在最后，串口就是主控制台（systemd 用最后一个）。这机器没有 HDMI，
+所以 `tty1` 那一路实际上没有意义，想干净点可以在 `/boot/armbianEnv.txt` 里
+改成 `console="serial"`。
+
+> 串口是有密码保护的：本镜像删掉了 Armbian 构建时装的 `agetty --autologin root`
+> 覆盖文件，所以接串口也需要输入 root 密码。
 
 ---
 
@@ -128,7 +136,7 @@ try emmc boot        ← 在探测 eMMC
 | 网口 MAC | `ethmac`，RMII，`eth_rmii_pins` |
 | 网口 PHY 复位 | GPIOH_4，低有效 |
 | eMMC | `sdhc`（`meson-mx-sdhc`），BOOT bank 8 线，别名 `mmc1` → `/dev/mmcblk1` |
-| SD 卡槽 | `sdio`（`meson-mx-sdio`），CARD bank 4 线，检测脚 CARD_6，别名 `mmc0` |
+| SD 卡槽 | `sdio`（`meson-mx-sdio`），别名 `mmc0` —— **节点从玩客云继承，实际机器一般没有卡槽**，留着无害 |
 | USB | `usb0` @ 0xC9040000，OTG |
 | CPU 调压 | PWM_D 上的 `pwm-regulator`，860mV~1140mV |
 | 红灯 | GPIOAO_2，触发器 `default-on`（电源指示） |
@@ -147,6 +155,6 @@ try emmc boot        ← 在探测 eMMC
 | USB | ✅ `dwc2`，含 USB 存储 |
 | SD / eMMC | ✅ `meson-mx-sdio` / `meson-mx-sdhc` |
 | 裸 NAND | ❌ **无驱动**（`meson_nand.c` 只支持 gxl / axg） |
-| HDMI | ⚠️ 有 `drm/meson`，但这机器基本没人接屏 |
+| HDMI | — 内核有 `drm/meson`，但**这块板子没有视频输出**，用不上 |
 | 温度传感 | ⚠️ meson8b 支持有限 |
 | GPU (Mali-450) | ⚠️ lima 驱动，对这机器没什么意义 |
