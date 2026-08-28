@@ -294,11 +294,19 @@ Armbian 用 `chroot ... /usr/bin/env bash -c` 调 `customize-image.sh`，
 我没能只靠读代码确认 —— 大概率是烧录工具写 `bootloader` 分区时的实际落盘位置，
 和我推断的分区偏移不一样。
 
-**对使用者的意义**：eMMC 版第一次刷完如果起不来，接串口看。如果看到
-`** Partition 1 not valid on device 1 **` 或 `fatload` 失败，就是这个原因，
-此时的绕行办法是：插 U 盘启动，然后手工给 eMMC 写一个 MBR（p1 从 16MiB 起、
-256MiB 大小、类型 c；p2 接在后面、类型 83），再重启。请把结果反馈回来，
-确认后我会把这一步固化进构建流程。
+**对使用者的意义，以及怎么在没有串口的情况下判断**：
+
+eMMC 版刷完 `.burn.img`、拔掉 U 盘、通电，等 2 分钟：
+
+- **能在路由器里看到 `ws1508` / 能 SSH 进去** → 这一环没问题，直刷可用；
+- **完全没上网** → 大概率就是这个原因。不用接串口，直接走
+  `ws1508-install-to-emmc` 那条路（刷 `ws1508-uboot.burn.img` →
+  U 盘启动 → 跑脚本），它自己写 MBR，绕开整个问题。
+
+只有在你**想知道具体卡在哪**的时候才需要串口，那时的特征是
+`** Partition 1 not valid on device 1 **` 或 `fatload` 失败。
+
+请把结果反馈回来，确认后我会把写 MBR 这一步固化进构建流程。
 
 ---
 
@@ -316,5 +324,9 @@ Armbian 用 `chroot ... /usr/bin/env bash -c` 调 `customize-image.sh`，
   如果实机 eMMC 不稳定，先把这两项降下来试；
 - 完整 `.burn.img` 在 NAND 版机器上的行为（预期：引导能写，
   boot/rootfs 白写，最后还是从 U 盘启动）。
+
+**这些都不需要串口就能反馈。** U-Boot 的存储探测结果会通过内核命令行
+`ws1508.store=`（1=NAND / 2=eMMC / 3=没探测到）传进系统，
+SSH 进去跑 `ws1508-info` 就能看到，机器能上网就够了。
 
 欢迎有实机的同学反馈。

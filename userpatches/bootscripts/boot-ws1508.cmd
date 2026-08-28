@@ -67,6 +67,13 @@ setenv bootargs "${bootargs} root=${rootdev} rootwait rw"
 setenv bootargs "${bootargs} ${consoleargs}"
 setenv bootargs "${bootargs} ${extraargs}"
 
+# Carry the bootloader's storage detection into the running system, so
+# "which variant is this, and did the bootloader find its flash?" can be
+# answered over SSH instead of needing a soldering iron and a USB-TTL
+# adapter. ${store} is set by set_storage_device_flag() before bootcmd:
+# 1 = NAND, 2 = eMMC, 3 = nothing detected. ws1508-info decodes it.
+setenv bootargs "${bootargs} ws1508.store=${store}"
+
 # Booting.
 #
 # Load addresses matter on this board. DRAM starts at 0x0 and the WS1508

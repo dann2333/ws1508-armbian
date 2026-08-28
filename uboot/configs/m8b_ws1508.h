@@ -276,6 +276,15 @@
 	\
 	"loadaddr=0x12000000\0" \
 	\
+	/* Seeded so the detected storage type becomes readable from   */ \
+	/* Linux. set_storage_device_flag() (common/partition_table.c) */ \
+	/* runs before bootcmd and rewrites this with the runtime      */ \
+	/* device_boot_flag -- but ONLY if "store" already exists in   */ \
+	/* the environment; with no seed it returns early and the      */ \
+	/* result is visible nowhere but the serial console.           */ \
+	/* 0=SPI 1=NAND 2=eMMC 3=nothing detected.                     */ \
+	"store=3\0" \
+	\
 	/* Load and run /boot.scr from whatever ${bootdev} currently is.  */ \
 	/* Armbian's boot script reads ${bootdev} back to find the rest   */ \
 	/* of /boot, so it must stay set to the device we booted from.    */ \

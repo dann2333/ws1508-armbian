@@ -302,7 +302,19 @@ install_helper() {
 		echo "kernel:  $(uname -r)"
 		printf 'memory:  '; awk '/MemTotal/ {printf "%d MB\n", $2/1024}' /proc/meminfo
 		echo
-		echo "--- internal storage ---"
+		echo "--- what the bootloader found ---"
+		# u-boot's own storage detection, handed over on the kernel command
+		# line by boot-ws1508.cmd. This is the answer without a serial cable.
+		store=$(sed -n 's/.*ws1508\.store=\([0-9]*\).*/\1/p' /proc/cmdline)
+		case "$store" in
+		    0) echo "store:   SPI (unexpected on this board)" ;;
+		    1) echo "store:   raw NAND  <- u-boot detected NAND" ;;
+		    2) echo "store:   eMMC      <- u-boot detected eMMC" ;;
+		    3) echo "store:   NONE detected - u-boot found no internal flash." ;;
+		    *) echo "store:   (not reported; bootloader predates this feature)" ;;
+		esac
+		echo
+		echo "--- internal storage as Linux sees it ---"
 		if [ -e /sys/class/mmc_host/mmc1/mmc1:0001 ] || \
 		   lsblk -dno NAME 2>/dev/null | grep -q '^mmcblk1$'; then
 		    size=$(lsblk -bdno SIZE /dev/mmcblk1 2>/dev/null)
