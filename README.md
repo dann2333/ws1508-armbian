@@ -55,6 +55,10 @@
 
 完整步骤（含进入刷机模式、救砖）见 [`docs/flashing.md`](docs/flashing.md)。
 
+eMMC 版还有一条**更稳妥的备选路线**：只刷 `ws1508-uboot.burn.img`，
+U 盘启动后 SSH 进去跑 `ws1508-install-to-emmc`，由它自己在 eMMC 上写标准
+MBR 并把系统装进去。不依赖烧录工具的分区行为，失败了插回 U 盘就复原。
+
 ### 首次登录
 
 刷完插网线通电，等约 1 分钟，然后：
@@ -70,7 +74,11 @@ ssh root@<设备IP>        # 也可以试 ssh root@ws1508.local
 
 - 开机自启 `sshd`，允许 root 登录；
 - 去掉了 Armbian 首次登录必须交互设置密码 / 建用户的向导；
-- SSH 主机密钥在**首次开机时才生成**（不会所有人的机器共用同一份密钥）。
+- SSH 主机密钥在**首次开机时由 `armbian-firstrun` 重新生成**，
+  所以不会所有人的机器长期共用同一份密钥。
+  （镜像里保留了构建时的密钥：Armbian 的 `armbian-firstrun.service` 是
+  `After=ssh.service`，构建期就删掉密钥的话，首次开机 sshd 会因为
+  `sshd -t` 失败而根本起不来。）
 
 > 🔒 刷完请立刻 `passwd` 改密码。默认密码是为了让你能进得去，不是为了长期用。
 > 如果这台机器会暴露在公网上，建议编译时直接填 SSH 公钥并把
@@ -171,8 +179,9 @@ userpatches/
   bootenv/ws1508.txt          /boot/armbianEnv.txt 模板
   kernel/archive/meson-6.12/
     0000.patching_config.yaml 让 Armbian 自动把 dts 塞进内核并改 Makefile
-    dt/meson8b-ws1508.dts     设备树（已修正内存为 512MB、网口为 RMII）
+    dt/meson8b-ws1508.dts     设备树（已修正内存为 512MB / 基址 0、网口为 RMII）
   customize-image.sh          SSH 自启 + 512MB 调优
+  overlay/ws1508-install-to-emmc  在机器上把系统装进 eMMC（自己写 MBR）
 scripts/
   common.sh                   共用配置（上游仓库均已固定 commit）
   build-uboot.sh              编译 U-Boot 并打包引导刷机包

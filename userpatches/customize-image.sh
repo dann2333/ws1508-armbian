@@ -43,6 +43,11 @@ HOSTNAME="${WS1508_HOSTNAME:-ws1508}"
 TIMEZONE="${WS1508_TIMEZONE:-Asia/Shanghai}"
 EXTRA_PACKAGES="${WS1508_EXTRA_PACKAGES:-}"
 
+# Needed by /usr/local/sbin/ws1508-install-to-emmc. BUILD_MINIMAL images do
+# not carry rsync or dosfstools, and discovering that only when the user
+# tries to install to eMMC would be a poor joke.
+REQUIRED_PACKAGES="rsync dosfstools e2fsprogs util-linux parted"
+
 say() { printf '\n\033[1;36m[ws1508]\033[0m %s\n' "$*"; }
 
 # ---------------------------------------------------------------------------
@@ -323,12 +328,24 @@ install_helper() {
 	EOF
 	chmod +x /usr/local/sbin/ws1508-info
 
+	# The on-device eMMC installer: an alternative to flashing the full
+	# *.burn.img that writes a normal MBR itself, so it does not depend on
+	# how the Amlogic burning tool happens to lay partitions out. Shipped
+	# as a file in userpatches/overlay rather than inlined here, because it
+	# is long enough to want reviewing on its own.
+	if [ -r /tmp/overlay/ws1508-install-to-emmc ]; then
+		install -m 0755 /tmp/overlay/ws1508-install-to-emmc \
+			/usr/local/sbin/ws1508-install-to-emmc
+	fi
+
 	# Show the essentials, including the default-password warning, on login.
 	cat > /etc/update-motd.d/09-ws1508 <<-EOF
 		#!/bin/sh
 		echo ""
 		echo "  Xunlei WS1508 - Armbian (ws1508-armbian)"
 		echo "  Run 'ws1508-info' to see RAM, storage type and root device."
+		echo "  Booted from USB on an eMMC unit? 'ws1508-install-to-emmc'"
+		echo "  copies this system to the internal eMMC."
 	EOF
 	if [ "${ROOT_PASSWORD_LOGIN}" = "yes" ] && [ -z "${SSH_KEY}" ]; then
 		cat >> /etc/update-motd.d/09-ws1508 <<-EOF
@@ -342,12 +359,14 @@ install_helper() {
 }
 
 install_packages() {
-	[ -n "${EXTRA_PACKAGES}" ] || return 0
-	say "Installing extra packages: ${EXTRA_PACKAGES}"
+	local pkgs="${REQUIRED_PACKAGES} ${EXTRA_PACKAGES}"
+	# shellcheck disable=SC2086
+	set -- ${pkgs}
+	[ "$#" -gt 0 ] || return 0
+	say "Installing packages: $*"
 	export DEBIAN_FRONTEND=noninteractive
 	apt-get -y update
-	# shellcheck disable=SC2086
-	apt-get -y --no-install-recommends install ${EXTRA_PACKAGES}
+	apt-get -y --no-install-recommends install "$@"
 	apt-get -y clean
 	rm -rf /var/lib/apt/lists/*
 }

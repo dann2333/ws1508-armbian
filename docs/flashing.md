@@ -96,6 +96,32 @@ sudo dd if=Armbian_*_ws1508_*.img of=/dev/sdX bs=4M status=progress conv=fsync
 
 ---
 
+## 一（备选）、eMMC 版：先 U 盘启动，再装进 eMMC
+
+如果直刷 `.burn.img` 之后机器起不来（见
+[`development.md`](development.md) 里「eMMC 直刷：一个没能静态确认的环节」），
+或者你就是想稳妥一点，可以走这条路。它**不依赖烧录工具怎么摆分区**，
+是自己在机器上写一个标准 MBR，所以更可控。
+
+1. 按上面「二、NAND 版」的步骤刷 `ws1508-uboot.burn.img`（只刷引导）；
+2. 做一张启动 U 盘，插上开机，SSH 进去；
+3. 跑一条命令：
+
+```bash
+sudo ws1508-install-to-emmc
+```
+
+它会：确认你确实是 eMMC 版 → 在 eMMC 上写 MBR（p1 从 16MiB 起 256MiB FAT32，
+p2 接在后面 ext4，**前 16MiB 的 u-boot 区域不动**）→ 建文件系统 →
+把当前系统整个 rsync 过去 → 改好新的 `armbianEnv.txt` 和 `fstab`
+（顺便给新根分区换一个 UUID，避免和 U 盘撞车）。
+
+4. `poweroff`，拔掉 U 盘，通电。
+
+失败也不要紧：引导没被动过，把 U 盘插回去就回到原样。
+
+---
+
 ## 三、只想试试，不动内置存储
 
 任何版本的机器都可以：先只做一张启动 U 盘，什么都不刷。

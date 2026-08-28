@@ -1,0 +1,167 @@
+#!/bin/bash
+#
+# Install the running WS1508 system onto the internal eMMC.
+#
+# This is the alternative to flashing the full *.burn.img: boot the box
+# from a USB stick, run this once, remove the stick. It writes a normal
+# MBR plus a FAT boot partition and an ext4 root partition at the offsets
+# the bootloader expects, so it does not depend on how the Amlogic
+# burning tool lays partitions out.
+#
+# It never touches the bootloader area (the first 16MiB), so the u-boot
+# you flashed with the USB Burning Tool stays exactly where it is.
+#
+# Only works on eMMC units. Raw-NAND units have no block device here at
+# all -- mainline Linux has no meson8b NAND driver -- and there is
+# nothing this script can do for them.
+
+set -euo pipefail
+
+DEV=/dev/mmcblk1
+BOOT_START_MIB=16     # must match OFFSET in the Armbian board config
+BOOT_SIZE_MIB=256     # must match BOOTSIZE
+ROOT_START_MIB=$((BOOT_START_MIB + BOOT_SIZE_MIB))
+
+die()  { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+
+[ "$(id -u)" -eq 0 ] || die "Run this as root."
+
+# ---------------------------------------------------------------------------
+# Checks
+# ---------------------------------------------------------------------------
+[ -b "${DEV}" ] || die "No ${DEV}. This looks like a raw-NAND WS1508, which
+cannot hold a mainline-kernel root filesystem. Keep running from USB.
+Run 'ws1508-info' to confirm which variant you have."
+
+ROOTSRC="$(findmnt -no SOURCE /)"
+case "${ROOTSRC}" in
+	"${DEV}"*)
+		die "The running system is already on ${DEV}. Boot from USB to reinstall."
+		;;
+esac
+
+for t in sfdisk mkfs.vfat mkfs.ext4 rsync blkid partprobe; do
+	command -v "$t" >/dev/null 2>&1 || die "Missing required tool: $t (apt-get install rsync dosfstools parted util-linux e2fsprogs)"
+done
+
+DEV_MIB=$(( $(blockdev --getsize64 "${DEV}") / 1024 / 1024 ))
+[ "${DEV_MIB}" -gt $((ROOT_START_MIB + 512)) ] \
+	|| die "${DEV} is only ${DEV_MIB}MiB; need more than $((ROOT_START_MIB + 512))MiB."
+
+USED_MIB=$(( $(df --output=used -BM / | tail -1 | tr -dc '0-9') ))
+AVAIL_MIB=$((DEV_MIB - ROOT_START_MIB))
+[ "${AVAIL_MIB}" -gt $((USED_MIB + 256)) ] \
+	|| die "Root filesystem uses ${USED_MIB}MiB but only ${AVAIL_MIB}MiB would be available on ${DEV}."
+
+cat <<EOF
+
+  This will ERASE everything on ${DEV} (${DEV_MIB}MiB internal eMMC)
+  and copy the running system onto it.
+
+  Layout to be written:
+    MBR
+    p1  ${BOOT_START_MIB}MiB .. $((ROOT_START_MIB))MiB    FAT32  /boot
+    p2  ${ROOT_START_MIB}MiB .. end          ext4   /
+    (the first ${BOOT_START_MIB}MiB, holding u-boot, is left untouched)
+
+  Currently running from: ${ROOTSRC}
+  Root filesystem in use: ${USED_MIB}MiB
+
+EOF
+read -r -p "  Type YES to continue: " answer
+[ "${answer}" = "YES" ] || die "Aborted."
+
+# ---------------------------------------------------------------------------
+# Partition
+# ---------------------------------------------------------------------------
+info "Writing the partition table to ${DEV}"
+# --no-reread/--force: the kernel may hold a stale table for this device.
+sfdisk --no-reread --force "${DEV}" >/dev/null <<EOF
+label: dos
+unit: sectors
+${DEV}p1 : start=$((BOOT_START_MIB * 2048)), size=$((BOOT_SIZE_MIB * 2048)), type=c, bootable
+${DEV}p2 : start=$((ROOT_START_MIB * 2048)), type=83
+EOF
+
+partprobe "${DEV}" || true
+udevadm settle 2>/dev/null || sleep 2
+[ -b "${DEV}p1" ] && [ -b "${DEV}p2" ] || die "Partition devices did not appear. Reboot and re-run."
+
+info "Creating filesystems"
+mkfs.vfat -F32 -n BOOT "${DEV}p1" >/dev/null
+mkfs.ext4 -q -F -L ROOT "${DEV}p2"
+
+# A fresh UUID matters: if the eMMC root kept the same UUID as the USB
+# stick it was copied from, root=UUID= could resolve to either one and the
+# USB rescue path stops being reliable.
+tune2fs -U random "${DEV}p2" >/dev/null
+
+# ---------------------------------------------------------------------------
+# Copy
+# ---------------------------------------------------------------------------
+TARGET=$(mktemp -d)
+cleanup() {
+	umount "${TARGET}/boot" 2>/dev/null || true
+	umount "${TARGET}" 2>/dev/null || true
+	rmdir "${TARGET}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+mount "${DEV}p2" "${TARGET}"
+mkdir -p "${TARGET}/boot"
+mount "${DEV}p1" "${TARGET}/boot"
+
+info "Copying the root filesystem (this takes several minutes on eMMC)"
+# -x keeps rsync on the root filesystem: without it a mounted USB data
+# disk, or the target we just mounted, would get copied into the clone.
+rsync -aHAXx --info=progress2 \
+	--exclude='/dev/*' --exclude='/proc/*' --exclude='/sys/*' \
+	--exclude='/tmp/*' --exclude='/run/*' --exclude='/mnt/*' \
+	--exclude='/media/*' --exclude='/lost+found' \
+	--exclude='/boot/*' \
+	/ "${TARGET}/"
+
+info "Copying /boot"
+rsync -rLtDv /boot/ "${TARGET}/boot/"
+
+# ---------------------------------------------------------------------------
+# Point the new system at itself
+# ---------------------------------------------------------------------------
+ROOT_UUID="$(blkid -s UUID -o value "${DEV}p2")"
+BOOT_UUID="$(blkid -s UUID -o value "${DEV}p1")"
+info "New root UUID: ${ROOT_UUID}"
+
+if [ -f "${TARGET}/boot/armbianEnv.txt" ]; then
+	sed -i "s|^rootdev=.*|rootdev=UUID=${ROOT_UUID}|" "${TARGET}/boot/armbianEnv.txt"
+	grep -q '^rootdev=' "${TARGET}/boot/armbianEnv.txt" \
+		|| echo "rootdev=UUID=${ROOT_UUID}" >> "${TARGET}/boot/armbianEnv.txt"
+fi
+
+cat > "${TARGET}/etc/fstab" <<EOF
+UUID=${ROOT_UUID}  /       ext4  defaults,noatime,commit=600,errors=remount-ro  0 1
+UUID=${BOOT_UUID}  /boot   vfat  defaults                                       0 2
+tmpfs              /tmp    tmpfs defaults,nosuid                                0 0
+EOF
+
+# The copy is a clone of a system that already finished its first boot, so
+# make sure the resize does not try to run again against the new device.
+rm -f "${TARGET}/root/.rootfs_resized" 2>/dev/null || true
+rm -f "${TARGET}/var/lib/armbian-resize-filesystem" 2>/dev/null || true
+
+sync
+info "Done."
+cat <<EOF
+
+  Now:
+    1. poweroff
+    2. unplug the USB stick
+    3. power on
+
+  The bootloader tries USB first, then SD, then eMMC, so with the stick
+  removed it will boot from the internal eMMC.
+
+  If it does not come up, put the stick back in and you are back where you
+  started -- nothing about the bootloader changed.
+
+EOF
