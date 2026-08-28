@@ -1,0 +1,27 @@
+# Armbian patching config for the meson (S805 / meson8b, 32-bit) kernel.
+#
+# This tells Armbian's patching tool to copy every .dts in the sibling
+# "dt/" directory into the kernel's arch/arm/boot/dts/amlogic/, and then
+# to append a dtb-$(CONFIG_MACH_MESON8) line for each of them to that
+# directory's Makefile.
+#
+# Doing it this way rather than shipping a hand-written .patch means
+# nothing here has to be rebased when upstream touches the amlogic DT
+# Makefile -- there is no context to conflict with.
+#
+# Note the config var really is CONFIG_MACH_MESON8, not ...MESON8B: in
+# arch/arm/boot/dts/amlogic/Makefile the meson8b boards are all listed
+# under the MESON8 symbol.
+config:
+  name: meson-6.12-ws1508
+  kind: kernel
+
+  dts-directories:
+    - { source: "dt", target: "arch/arm/boot/dts/amlogic" }
+
+  auto-patch-dt-makefile:
+    - { add-only: true, directory: "arch/arm/boot/dts/amlogic", config-var: "CONFIG_MACH_MESON8" }
+
+  patches-to-git:
+    do-not-commit-regexes:
+      - "^arch/([a-zA-Z0-9]+)/boot/dts/.*/Makefile$"

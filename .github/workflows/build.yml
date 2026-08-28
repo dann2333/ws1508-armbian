@@ -1,0 +1,269 @@
+name: Build WS1508 Armbian
+
+on:
+  workflow_dispatch:
+    inputs:
+      release:
+        description: 'Userland release'
+        required: true
+        default: 'bookworm'
+        type: choice
+        options:
+          - bookworm    # Debian 12
+          - trixie      # Debian 13
+          - noble       # Ubuntu 24.04 LTS
+      kernel_branch:
+        description: 'Armbian kernel branch'
+        required: true
+        default: 'current'
+        type: choice
+        options:
+          - current     # 6.12.x, the only branch the meson family pins
+          - edge
+      build_type:
+        description: 'Image size'
+        required: true
+        default: 'minimal'
+        type: choice
+        options:
+          - minimal     # recommended: this board has 512MB of RAM and 4GB of storage
+          - cli
+      root_password:
+        description: 'Default root password baked into the image'
+        required: false
+        default: '1234'
+      ssh_authorized_key:
+        description: 'Optional SSH public key to install for root'
+        required: false
+        default: ''
+      publish_release:
+        description: 'Publish the result as a GitHub Release'
+        required: true
+        default: true
+        type: boolean
+
+  push:
+    branches:
+      - main
+      - 'claude/**'
+    paths:
+      - '.github/workflows/build.yml'
+      - 'uboot/**'
+      - 'userpatches/**'
+      - 'scripts/**'
+
+permissions:
+  contents: write
+
+env:
+  TZ: Asia/Shanghai
+  # Everything heavy goes on the runner's large scratch disk; the root
+  # filesystem does not have room for an Armbian build.
+  WORKDIR: /mnt/ws1508/work
+  OUTDIR: /mnt/ws1508/out
+
+jobs:
+  # ---------------------------------------------------------------------
+  # The bootloader. Small and quick (~3 minutes), and it is what makes the
+  # image flashable to internal storage at all, so it is built first and
+  # independently: if this fails there is no point building an image.
+  # ---------------------------------------------------------------------
+  uboot:
+    name: Build bootloader
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare scratch space
+        run: |
+          sudo mkdir -p "${WORKDIR}" "${OUTDIR}"
+          sudo chown -R "$(id -u):$(id -g)" /mnt/ws1508
+
+      - name: Install build dependencies
+        run: |
+          # The Amlogic vendor toolchain bundled with the u-boot tree is a
+          # 32-bit x86 binary, hence the i386 multiarch libraries.
+          sudo dpkg --add-architecture i386
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y --no-install-recommends \
+            build-essential git curl xz-utils \
+            libc6:i386 zlib1g:i386 libstdc++6:i386
+
+      - name: Build u-boot and pack the bootloader burn image
+        run: bash scripts/build-uboot.sh
+
+      - name: Upload bootloader
+        uses: actions/upload-artifact@v4
+        with:
+          name: ws1508-uboot
+          path: |
+            /mnt/ws1508/out/uboot/ws1508-uboot.burn.img
+            /mnt/ws1508/out/uboot/burn-base/**
+          retention-days: 14
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------
+  # The Armbian image, plus the combined direct-flash burn package.
+  # ---------------------------------------------------------------------
+  image:
+    name: Build image (${{ inputs.release || 'bookworm' }} / ${{ inputs.build_type || 'minimal' }})
+    needs: uboot
+    runs-on: ubuntu-24.04
+    outputs:
+      image_name: ${{ steps.collect.outputs.image_name }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Free up disk space
+        run: |
+          # An Armbian build wants ~25GB. The runner's root filesystem does
+          # not have that spare, but /mnt does; still, reclaim the obvious
+          # dead weight so apt and docker have room.
+          echo "Before:"; df -h / /mnt
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost /usr/lib/jvm \
+                      "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
+          sudo apt-get -qq purge -y '^dotnet-.*' '^llvm-.*' '^mysql-.*' '^mongodb-.*' \
+                                    azure-cli google-chrome-stable firefox 2>/dev/null || true
+          sudo apt-get -qq autoremove -y || true
+          sudo apt-get -qq clean || true
+          echo "After:"; df -h / /mnt
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare scratch space
+        run: |
+          sudo mkdir -p "${WORKDIR}" "${OUTDIR}/uboot" "${OUTDIR}/images"
+          sudo chown -R "$(id -u):$(id -g)" /mnt/ws1508
+
+      - name: Download bootloader
+        uses: actions/download-artifact@v4
+        with:
+          name: ws1508-uboot
+          path: /mnt/ws1508/out/uboot
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get -qq update
+          sudo apt-get -qq install -y --no-install-recommends \
+            git curl xz-utils zstd jq python3 \
+            android-sdk-libsparse-utils device-tree-compiler
+
+      - name: Build metadata
+        id: meta
+        run: |
+          created="$(date -u +'%Y%m%d-%H%M%S')"
+          echo "tag=build-${created}" >> "$GITHUB_OUTPUT"
+          echo "name=WS1508 Armbian ${created}" >> "$GITHUB_OUTPUT"
+
+      - name: Build the Armbian image
+        env:
+          BOARD: ws1508
+          BRANCH: ${{ inputs.kernel_branch || 'current' }}
+          RELEASE: ${{ inputs.release || 'bookworm' }}
+          BUILD_MINIMAL: ${{ (inputs.build_type == 'cli') && 'no' || 'yes' }}
+          WS1508_ROOT_PASSWORD: ${{ inputs.root_password || '1234' }}
+          WS1508_SSH_AUTHORIZED_KEY: ${{ inputs.ssh_authorized_key }}
+          WS1508_TIMEZONE: Asia/Shanghai
+        run: |
+          sudo -E bash scripts/build-armbian.sh build
+
+      - name: Pack the direct-flash burn image
+        run: sudo -E bash scripts/make-burn-image.sh
+
+      - name: Collect artifacts
+        id: collect
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" /mnt/ws1508
+          cd "${OUTDIR}"
+
+          # The bootloader-only package belongs next to the images: it is
+          # what raw-NAND owners need.
+          cp uboot/ws1508-uboot.burn.img images/ 2>/dev/null || true
+
+          cd images
+
+          # GitHub Actions runs steps with `-o pipefail`, so avoid piping
+          # into `head` here: it would exit early and SIGPIPE the producer.
+          img=""
+          for f in *.img; do
+            case "$f" in *.burn.img) continue ;; esac
+            img="$f"
+            break
+          done
+          [ -n "$img" ] || { echo "::error::no Armbian .img was produced"; exit 1; }
+          echo "image_name=${img%.img}" >> "$GITHUB_OUTPUT"
+
+          # Compress the big raw image; leave the burn packages uncompressed
+          # because the USB Burning Tool has to open them directly.
+          xz -T0 -6 "${img}"
+
+          sha256sum -- * > ../sha256sums.txt
+          mv ../sha256sums.txt .
+          ls -la
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ws1508-${{ inputs.release || 'bookworm' }}-${{ inputs.build_type || 'minimal' }}
+          path: /mnt/ws1508/out/images/*
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Write release notes
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
+        run: |
+          cd "${OUTDIR}/images"
+          cat > /tmp/release.md <<'EOF'
+          ## 迅雷赚钱宝二代 (WS1508) Armbian
+
+          Amlogic S805 / meson8b · 512MB RAM · 100M 网口 · 1x USB 2.0
+
+          ### 下载哪个文件？
+
+          先确认你的机器是 **eMMC 版**还是 **NAND 版**（拆机看闪存芯片，或参考
+          `docs/hardware.md`）：
+
+          | 你的机器 | 下载 | 结果 |
+          |---|---|---|
+          | eMMC 版 | `*.burn.img` | 直刷内置存储，拔掉 U 盘也能开机 |
+          | NAND 版 | `ws1508-uboot.burn.img` | 只刷引导，系统跑在 U 盘上 |
+          | 想先试试不动内置存储 | `*.img.xz` | 写入 U 盘/SD 卡启动 |
+
+          两种 `.burn.img` 都用 **Amlogic USB Burning Tool** 刷入。
+          详细步骤见 `docs/flashing.md`。
+
+          ### 默认登录
+
+          - 用户名 `root`
+          - 密码见下方构建参数（默认 `1234`）
+          - 开机自动启动 SSH，直接 `ssh root@<设备IP>` 即可，无需接显示器或串口
+
+          **刷完请立刻 `passwd` 修改密码。**
+
+          ### 构建参数
+          EOF
+          {
+            echo ""
+            echo "- Release: \`${{ inputs.release || 'bookworm' }}\`"
+            echo "- Kernel branch: \`${{ inputs.kernel_branch || 'current' }}\`"
+            echo "- Image type: \`${{ inputs.build_type || 'minimal' }}\`"
+            echo ""
+            echo "### SHA256"
+            echo ""
+            echo '```'
+            cat sha256sums.txt
+            echo '```'
+          } >> /tmp/release.md
+          cat /tmp/release.md
+
+      - name: Publish release
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: ${{ steps.meta.outputs.name }}
+          body_path: /tmp/release.md
+          target_commitish: ${{ github.sha }}
+          files: /mnt/ws1508/out/images/*

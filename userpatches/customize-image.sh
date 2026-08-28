@@ -1,0 +1,335 @@
+#!/bin/bash
+#
+# Image customisation for the Xunlei WS1508 (Amlogic S805, 512MB RAM).
+#
+# Runs inside the image's chroot. Two jobs:
+#   1. Make the image usable headlessly: sshd up on first boot, no
+#      interactive first-run wizard standing between the user and a shell.
+#   2. Keep the running system inside 512MB of RAM.
+#
+# Build-time knobs:
+#   WS1508_ROOT_PASSWORD        root password to bake in (default: 1234)
+#   WS1508_SSH_AUTHORIZED_KEY   an SSH public key to install for root
+#   WS1508_ROOT_PASSWORD_LOGIN  "no" to allow key-only root SSH login
+#   WS1508_HOSTNAME             hostname (default: ws1508)
+#   WS1508_TIMEZONE             tz database name (default: Asia/Shanghai)
+#   WS1508_EXTRA_PACKAGES       extra packages to preinstall
+#
+# scripts/build-armbian.sh writes these to userpatches/overlay/ws1508-build.conf,
+# which Armbian bind-mounts at /tmp/overlay inside this chroot. That file is
+# the primary channel; plain environment variables are honoured as a
+# fallback for anyone running compile.sh by hand. Going through the overlay
+# rather than relying on the environment matters because Armbian invokes
+# this script via `chroot ... /usr/bin/env bash -c`, and what survives that
+# is an implementation detail we should not depend on.
+
+set -euo pipefail
+
+RELEASE="${1:-}"
+LINUXFAMILY="${2:-}"
+BOARD="${3:-}"
+BUILD_DESKTOP="${4:-}"
+ARCH="${5:-}"
+
+if [ -r /tmp/overlay/ws1508-build.conf ]; then
+	# shellcheck disable=SC1091
+	. /tmp/overlay/ws1508-build.conf
+fi
+
+ROOT_PASSWORD="${WS1508_ROOT_PASSWORD:-1234}"
+SSH_KEY="${WS1508_SSH_AUTHORIZED_KEY:-}"
+ROOT_PASSWORD_LOGIN="${WS1508_ROOT_PASSWORD_LOGIN:-yes}"
+HOSTNAME="${WS1508_HOSTNAME:-ws1508}"
+TIMEZONE="${WS1508_TIMEZONE:-Asia/Shanghai}"
+EXTRA_PACKAGES="${WS1508_EXTRA_PACKAGES:-}"
+
+say() { printf '\n\033[1;36m[ws1508]\033[0m %s\n' "$*"; }
+
+# ---------------------------------------------------------------------------
+# SSH: reachable on first boot, with no console interaction
+# ---------------------------------------------------------------------------
+setup_ssh() {
+	say "Configuring SSH for headless first boot"
+
+	# Armbian ships a first-login wizard that runs from /etc/profile.d on
+	# every login while /root/.not_logged_in_yet exists. It forces a root
+	# password change AND a new-user creation before it will let go. That
+	# is exactly wrong for a headless box you only ever reach over SSH, so
+	# the marker is removed and the same configuration is applied here
+	# instead.
+	rm -f /root/.not_logged_in_yet
+
+	# The wizard would normally chmod +x these; do it ourselves so the
+	# login banner still works.
+	chmod +x /etc/update-motd.d/* 2>/dev/null || true
+
+	echo "root:${ROOT_PASSWORD}" | chpasswd
+
+	mkdir -p /etc/ssh/sshd_config.d
+	{
+		echo "# Installed by the ws1508-armbian image build."
+		echo "# Edit this file (or /etc/ssh/sshd_config) to change SSH policy."
+		if [ "${ROOT_PASSWORD_LOGIN}" = "no" ]; then
+			echo "PermitRootLogin prohibit-password"
+			echo "PasswordAuthentication no"
+		else
+			echo "PermitRootLogin yes"
+			echo "PasswordAuthentication yes"
+		fi
+		echo "UseDNS no"
+		echo "ClientAliveInterval 60"
+	} > /etc/ssh/sshd_config.d/10-ws1508.conf
+
+	# Older sshd builds ignore the drop-in directory unless it is included.
+	if ! grep -qE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/' /etc/ssh/sshd_config; then
+		sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' /etc/ssh/sshd_config
+	fi
+
+	if [ -n "${SSH_KEY}" ]; then
+		say "Installing the provided SSH public key for root"
+		mkdir -p /root/.ssh
+		chmod 700 /root/.ssh
+		printf '%s\n' "${SSH_KEY}" > /root/.ssh/authorized_keys
+		chmod 600 /root/.ssh/authorized_keys
+	fi
+
+	# Host keys are deliberately NOT generated here: baking them into a
+	# published image would give every WS1508 in the world the same host
+	# key. Instead make sure they are generated on first boot.
+	rm -f /etc/ssh/ssh_host_*
+	systemctl enable ssh.service 2>/dev/null || systemctl enable sshd.service 2>/dev/null || true
+	if [ -f /lib/systemd/system/ssh.service ] || [ -f /etc/systemd/system/ssh.service ]; then
+		systemctl enable ssh.service || true
+	fi
+	# Debian generates missing host keys via this unit; make sure it runs.
+	systemctl enable ssh-keygen.service 2>/dev/null || true
+	# Belt and braces for images where the keygen unit is absent.
+	cat > /etc/systemd/system/ws1508-sshd-keygen.service <<-'EOF'
+		[Unit]
+		Description=Generate SSH host keys if missing
+		Before=ssh.service
+		ConditionPathExistsGlob=|!/etc/ssh/ssh_host_*_key
+
+		[Service]
+		Type=oneshot
+		RemainAfterExit=yes
+		ExecStart=/usr/bin/ssh-keygen -A
+
+		[Install]
+		WantedBy=multi-user.target
+	EOF
+	systemctl enable ws1508-sshd-keygen.service || true
+}
+
+# ---------------------------------------------------------------------------
+# Identity and locale
+# ---------------------------------------------------------------------------
+setup_identity() {
+	say "Setting hostname to ${HOSTNAME} and timezone to ${TIMEZONE}"
+	echo "${HOSTNAME}" > /etc/hostname
+	if grep -q '127.0.1.1' /etc/hosts; then
+		sed -i "s/^127\.0\.1\.1.*/127.0.1.1\t${HOSTNAME}/" /etc/hosts
+	else
+		echo -e "127.0.1.1\t${HOSTNAME}" >> /etc/hosts
+	fi
+
+	if [ -f "/usr/share/zoneinfo/${TIMEZONE}" ]; then
+		ln -sf "/usr/share/zoneinfo/${TIMEZONE}" /etc/localtime
+		echo "${TIMEZONE}" > /etc/timezone
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# Memory: this board has 512MB and no swap partition
+# ---------------------------------------------------------------------------
+setup_memory() {
+	say "Tuning for 512MB of RAM"
+
+	# zram. Armbian enables its zram service by default; these values are
+	# picked for a small, slow, flash-backed box:
+	#   - lz4 for swap. On a 1.5GHz Cortex-A5 the compression ratio gain
+	#     from zstd is not worth its CPU cost in the swap path.
+	#   - 200% of DRAM as zram disksize with a 50% memory limit, i.e. up to
+	#     ~1GB of compressed swap that can occupy at most ~256MB of real
+	#     RAM. Overcommitting like this is the point of zram.
+	#   - zstd for the log and /tmp devices, which are written rarely and
+	#     benefit from the better ratio.
+	cat > /etc/default/armbian-zram-config <<-'EOF'
+		# Tuned for the WS1508's 512MB of RAM by the ws1508-armbian build.
+		ENABLED=true
+
+		SWAP=true
+		# 200% of DRAM as compressed swap...
+		ZRAM_PERCENTAGE=200
+		# ...but never let it hold more than 50% of DRAM of compressed data.
+		MEM_LIMIT_PERCENTAGE=50
+		# lz4 is the right trade-off on a Cortex-A5: much cheaper than zstd
+		# and the ratio difference barely matters for swap pages.
+		SWAP_ALGORITHM=lz4
+		SWAP_PRIORITY=100
+		ZRAM_MAX_DEVICES=1
+
+		RAMLOG_ALGORITHM=zstd
+		TMP_ALGORITHM=zstd
+		TMP_SIZE=64M
+	EOF
+
+	# Keep the RAM log small; the default 50M is a lot on a 512MB box.
+	if [ -f /etc/default/armbian-ramlog ]; then
+		sed -i 's/^SIZE=.*/SIZE=32M/' /etc/default/armbian-ramlog
+	fi
+
+	cat > /etc/sysctl.d/98-ws1508-lowmem.conf <<-'EOF'
+		# Low-memory tuning for the WS1508 (512MB, zram swap, flash storage).
+
+		# With zram, swapping is cheap and should be preferred over evicting
+		# the page cache; the kernel default of 60 is tuned for spinning disks.
+		vm.swappiness = 100
+
+		# zram is random-access, so reading a cluster of neighbouring pages on
+		# a fault is pure waste. 0 means "fault in one page at a time".
+		vm.page-cluster = 0
+
+		# Reclaim dentry/inode caches more eagerly than the default 100.
+		vm.vfs_cache_pressure = 200
+
+		# Write dirty pages back sooner. Small absolute limits keep a burst of
+		# writes from pinning a large share of 512MB, and shorten the flush
+		# that would otherwise stall the box on slow eMMC/USB storage.
+		vm.dirty_ratio = 10
+		vm.dirty_background_ratio = 5
+
+		# Keep a reserve so the allocator does not fail under sudden pressure.
+		vm.min_free_kbytes = 8192
+
+		# Allow overcommit; without it, forking large processes fails early on
+		# a machine whose "swap" is compressed RAM.
+		vm.overcommit_memory = 0
+	EOF
+
+	# systemd's journal is a notable memory and flash consumer. Keep it in
+	# RAM and small; Armbian's ramlog already handles /var/log persistence.
+	mkdir -p /etc/systemd/journald.conf.d
+	cat > /etc/systemd/journald.conf.d/98-ws1508.conf <<-'EOF'
+		[Journal]
+		Storage=volatile
+		RuntimeMaxUse=16M
+		RuntimeMaxFileSize=4M
+		ForwardToSyslog=no
+		Compress=yes
+	EOF
+}
+
+# ---------------------------------------------------------------------------
+# Trim services this board cannot use or does not need at boot
+# ---------------------------------------------------------------------------
+trim_services() {
+	say "Disabling services this board has no hardware for"
+
+	# The WS1508 has no wireless, no Bluetooth and no modem.
+	for unit in ModemManager.service bluetooth.service wpa_supplicant.service \
+	            hciuart.service brcm-patchram-plus.service; do
+		systemctl disable "${unit}" 2>/dev/null || true
+		systemctl mask "${unit}" 2>/dev/null || true
+	done
+
+	# The unattended apt timers are the single biggest memory spike on a
+	# small box: apt's solver can transiently want hundreds of MB, and it
+	# fires while the user is doing something else. Updates stay entirely
+	# possible, just not automatic and not at a random moment.
+	for unit in apt-daily.timer apt-daily-upgrade.timer \
+	            unattended-upgrades.service man-db.timer; do
+		systemctl disable "${unit}" 2>/dev/null || true
+		systemctl mask "${unit}" 2>/dev/null || true
+	done
+
+	# man-db's index rebuild on every package install is slow and
+	# memory-hungry on this CPU, and the image has no man pages worth
+	# indexing.
+	cat > /etc/dpkg/dpkg.cfg.d/98-ws1508-nodoc <<-'EOF'
+		path-exclude=/usr/share/man/*
+		path-exclude=/usr/share/doc/*
+		path-include=/usr/share/doc/*/copyright
+	EOF
+}
+
+# ---------------------------------------------------------------------------
+# A small helper so users can tell which WS1508 variant they have
+# ---------------------------------------------------------------------------
+install_helper() {
+	say "Installing the ws1508-info helper"
+	cat > /usr/local/sbin/ws1508-info <<-'EOF'
+		#!/bin/sh
+		# Report what this WS1508 actually is, which decides whether the
+		# system can live on internal storage.
+		echo "=== WS1508 ==="
+		echo "model:   $(cat /proc/device-tree/model 2>/dev/null | tr -d '\0')"
+		echo "kernel:  $(uname -r)"
+		printf 'memory:  '; awk '/MemTotal/ {printf "%d MB\n", $2/1024}' /proc/meminfo
+		echo
+		echo "--- internal storage ---"
+		if [ -e /sys/class/mmc_host/mmc1/mmc1:0001 ] || \
+		   lsblk -dno NAME 2>/dev/null | grep -q '^mmcblk1$'; then
+		    size=$(lsblk -bdno SIZE /dev/mmcblk1 2>/dev/null)
+		    echo "type:    eMMC (/dev/mmcblk1)"
+		    [ -n "$size" ] && echo "size:    $((size / 1024 / 1024)) MB"
+		    echo
+		    echo "This unit CAN run entirely from internal storage."
+		    echo "Flash the full *.burn.img with the Amlogic USB Burning Tool."
+		else
+		    echo "type:    no eMMC detected - this is most likely a raw-NAND unit"
+		    echo
+		    echo "Mainline Linux has no driver for the S805's raw NAND"
+		    echo "controller, so the root filesystem must stay on USB or SD."
+		    echo "Flash ws1508-uboot.burn.img (bootloader only) and boot the"
+		    echo "system from a USB stick."
+		fi
+		echo
+		echo "--- current root ---"
+		findmnt -no SOURCE,FSTYPE,SIZE,USED /  2>/dev/null || df -h /
+		echo
+		echo "--- swap ---"
+		swapon --show 2>/dev/null || echo "(none)"
+	EOF
+	chmod +x /usr/local/sbin/ws1508-info
+
+	# Show the essentials, including the default-password warning, on login.
+	cat > /etc/update-motd.d/09-ws1508 <<-EOF
+		#!/bin/sh
+		echo ""
+		echo "  Xunlei WS1508 - Armbian (ws1508-armbian)"
+		echo "  Run 'ws1508-info' to see RAM, storage type and root device."
+	EOF
+	if [ "${ROOT_PASSWORD_LOGIN}" = "yes" ] && [ -z "${SSH_KEY}" ]; then
+		cat >> /etc/update-motd.d/09-ws1508 <<-EOF
+			echo ""
+			echo "  !! This image ships a default root password. Change it now:"
+			echo "  !!     passwd"
+		EOF
+	fi
+	echo 'echo ""' >> /etc/update-motd.d/09-ws1508
+	chmod +x /etc/update-motd.d/09-ws1508
+}
+
+install_packages() {
+	[ -n "${EXTRA_PACKAGES}" ] || return 0
+	say "Installing extra packages: ${EXTRA_PACKAGES}"
+	export DEBIAN_FRONTEND=noninteractive
+	apt-get -y update
+	# shellcheck disable=SC2086
+	apt-get -y --no-install-recommends install ${EXTRA_PACKAGES}
+	apt-get -y clean
+	rm -rf /var/lib/apt/lists/*
+}
+
+Main() {
+	setup_ssh
+	setup_identity
+	setup_memory
+	trim_services
+	install_helper
+	install_packages
+	say "WS1508 customisation done"
+}
+
+Main "$@"

@@ -1,0 +1,443 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Device tree for the Xunlei "Zhuanqianbao Pro" / 迅雷赚钱宝二代 (model WS1508).
+ *
+ * Amlogic S805 (meson8b), 4x Cortex-A5 @ 1.5GHz, 512MB DDR3,
+ * 4GB internal storage (raw NAND on early units, eMMC on later units),
+ * 100Mbit ethernet (RMII), a single USB 2.0 OTG port, 3 status LEDs
+ * and one button.
+ *
+ * Derived from the community meson8b-ws1508.dts written by hzyitc and
+ * modified by lunatickochiya, which in turn descends from the Thunder
+ * OneCloud (WS1608) device tree.
+ *
+ * NOTE ON RAM: the WS1508 has 512MB, NOT the 1GB of the OneCloud/WS1608
+ * this file descends from. The upstream community DTS kept the OneCloud's
+ * 1GiB memory node unchanged, which is a copy error. Teardown photos of
+ * two independent WS1508 v1.1 boards each show a single populated NANYA
+ * DDR3 x16 chip next to an unpopulated twin footprint -- a 16-bit bus
+ * carrying 512MB -- and the retail box silkscreen reads "RAM: DDR3-512MB".
+ * The Amlogic vendor u-boot auto-detects both the bus width and the size
+ * (CONFIG_DDR_MODE_AUTO_DETECT / CONFIG_DDR_SIZE_AUTO_DETECT) and rewrites
+ * this node via fdt_fixup_memory_banks() before entering Linux, so the
+ * value below is only a fallback -- but it is set correctly, and
+ * deliberately to the smaller size, so that a board booted by a loader
+ * that does NOT fix it up still comes up instead of touching absent RAM.
+ */
+
+/dts-v1/;
+#include "meson8b.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+
+/ {
+	model = "Xunlei WS1508";
+	compatible = "xunlei,ws1508", "amlogic,meson8b";
+
+	aliases {
+		serial0 = &uart_AO;
+		/* SD card slot is mmcblk0, internal eMMC is mmcblk1 */
+		mmc0 = &sd_card_slot;
+		mmc1 = &sdhc;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+	};
+
+	/*
+	 * DO NOT rename this to "memory@40000000", however much dtc's
+	 * unit_address_vs_reg warning wants you to. The Amlogic vendor
+	 * u-boot's fdt_fixup_memory_banks() resolves the node with
+	 * fdt_path_offset(blob, "/memory") -- an exact path match. Give the
+	 * node a unit address and that lookup misses, u-boot appends a
+	 * second, empty "memory" node and returns early WITHOUT writing
+	 * reg, and the detected DDR size is silently thrown away.
+	 */
+	memory {
+		device_type = "memory";
+		/* 512MB - overwritten by u-boot's memory-node fixup */
+		reg = <0x40000000 0x20000000>;
+	};
+
+	emmc_pwrseq: emmc-pwrseq {
+		compatible = "mmc-pwrseq-emmc";
+		reset-gpios = <&gpio BOOT_9 GPIO_ACTIVE_LOW>;
+	};
+
+	gpio-keys {
+		compatible = "gpio-keys";
+		autorepeat;
+
+		reset-button {
+			label = "reset";
+			linux,code = <KEY_RESTART>;
+
+			/*
+			 * Driven as a level interrupt rather than a polled
+			 * GPIO so that holding it is seen reliably.
+			 */
+			interrupt-parent = <&gpio_intc>;
+			interrupts = <5 IRQ_TYPE_LEVEL_LOW>; /* GPIOAO_5 */
+		};
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		/*
+		 * Triggers are chosen for a headless box that may root from
+		 * eMMC, SD or USB:
+		 *   red   - power / "board is up"
+		 *   green - activity on whichever block device is in use
+		 *   blue  - kernel heartbeat, so a hung kernel is visible
+		 *           without a serial cable
+		 */
+		led-red {
+			label = "ws1508:red:power";
+			gpios = <&gpio_ao GPIOAO_2 GPIO_ACTIVE_HIGH>;
+			default-state = "on";
+			linux,default-trigger = "default-on";
+		};
+
+		led-green {
+			label = "ws1508:green:disk";
+			gpios = <&gpio_ao GPIOAO_3 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+			linux,default-trigger = "disk-activity";
+		};
+
+		led-blue {
+			label = "ws1508:blue:status";
+			gpios = <&gpio_ao GPIOAO_4 GPIO_ACTIVE_HIGH>;
+			default-state = "off";
+			linux,default-trigger = "heartbeat";
+		};
+	};
+
+	p12v: regulator-p12v {
+		compatible = "regulator-fixed";
+
+		regulator-name = "P12V";
+		regulator-min-microvolt = <12000000>;
+		regulator-max-microvolt = <12000000>;
+	};
+
+	vcc_5v: regulator-vcc-5v {
+		compatible = "regulator-fixed";
+
+		regulator-name = "VCC5V";
+		regulator-min-microvolt = <5000000>;
+		regulator-max-microvolt = <5000000>;
+
+		vin-supply = <&p12v>;
+
+		regulator-boot-on;
+		regulator-always-on;
+	};
+
+	vcc_3v3: regulator-vcc-3v3 {
+		compatible = "regulator-fixed";
+
+		regulator-name = "VCC3V3";
+		regulator-min-microvolt = <3300000>;
+		regulator-max-microvolt = <3300000>;
+
+		vin-supply = <&p12v>;
+
+		regulator-boot-on;
+		regulator-always-on;
+	};
+
+	vcc_1v8: regulator-vcc-1v8 {
+		compatible = "regulator-fixed";
+
+		regulator-name = "VCC1V8";
+		regulator-min-microvolt = <1800000>;
+		regulator-max-microvolt = <1800000>;
+
+		vin-supply = <&p12v>;
+
+		regulator-boot-on;
+		regulator-always-on;
+	};
+
+	vcc_ddr: regulator-vcc-ddr {
+		compatible = "regulator-fixed";
+
+		regulator-name = "VCC_DDR";
+		regulator-min-microvolt = <1500000>;
+		regulator-max-microvolt = <1500000>;
+
+		vin-supply = <&vcc_3v3>;
+
+		regulator-boot-on;
+		regulator-always-on;
+	};
+
+	vcc_core: regulator-vcc-core {
+		compatible = "pwm-regulator";
+
+		regulator-name = "VCC_CORE";
+
+		/*
+		 *   +---------------------------------------------------+
+		 *   |           The actual mapping in physical          |
+		 *   +------+--------+--------+--------+--------+--------+
+		 *   |      |  100%  |   60%  |   30%  |   10%  |   0%   |
+		 *   +------+--------+--------+--------+--------+--------+
+		 *   | V1.0 |  677mV |  857mV |  992mV | 1082mV | 1127mV |
+		 *   | V1.3 | 1116mV | 1121mV | 1125mV | 1128mV | 1129mV |
+		 *   +------+--------+--------+--------+--------+--------+
+		 *
+		 * This rail supplies the GPU as well as the CPU, so the
+		 * voltages are kept above what meson8b.dtsi alone would
+		 * ask for.
+		 */
+		pwms = <&pwm_cd 1 12001 0>;	/* PWM_D */
+		pwm-dutycycle-range = <10 0>;
+		regulator-min-microvolt = <860000>;
+		regulator-max-microvolt = <1140000>;
+
+		pwm-supply = <&p12v>;
+
+		regulator-boot-on;
+		regulator-always-on;
+	};
+};
+
+&pwm_cd {
+	status = "okay";
+	pinctrl-0 = <&pwm_c1_pins>, <&pwm_d_pins>;
+	pinctrl-names = "default";
+	clocks = <&xtal>, <&xtal>;
+	clock-names = "clkin0", "clkin1";
+};
+
+&cpu0 {
+	cpu-supply = <&vcc_core>;
+};
+
+&mali {
+	/*
+	 * Left unattached from vcc_core on purpose: sharing the regulator
+	 * makes the GPU pin the voltage and blocks CPU DVFS.
+	 */
+};
+
+&gpio {
+	gpio-line-names =
+		/* 0-3 Bank GPIOX 0-3 */
+		"7U1_PIN_18", "7U1_PIN_19",
+		"7U1_PIN_14", "7U1_PIN_15",
+		/* 4-7 Bank GPIOX 4-7 */
+		"7U1_PIN_27", "7U1_PIN_25",
+		"7U1_PIN_28", "7U1_PIN_26",
+		/* 8 Bank GPIOX 8 */
+		"R_RightOf_LED",
+		/* 9 Bank GPIOX 9 */
+		"7U1_PIN_16",
+		/* 10 Bank GPIOX 10 */
+		"",
+		/* 11 Bank GPIOX 11 */
+		"7U1_PIN_12",
+		/* 12-16 Bank GPIOX 16-20 */
+		"7U1_PIN_43", "7U1_PIN_42",
+		"7U1_PIN_41(Resistor)", "7U1_PIN_44",
+		"7U1_PIN_34",
+		/* 17 Bank GPIOX 21 */
+		"7U1_PIN_13",
+
+		/* 18 Bank GPIOY 0 */
+		"Resistor_TopOf_LED",
+		/* 19-20 Bank GPIOY 1-3 */
+		"", "",
+		/* 21-26 Bank GPIOY 6-11 */
+		"", "",
+		"", "",
+		"", "",
+		/* 27 Bank GPIOY 12 */
+		"",
+		/* 28-29 Bank GPIOY 13-14 */
+		"Left_BottomOf_CPU", "Right_BottomOf_CPU",
+
+		/* 30 Bank GPIODV 9 */
+		"VCCK_PWM (PWM_C)",
+		/* 31-35 Bank GPIODV 24-28 */
+		"I2CA_SDA", "I2CA_SCL",
+		"I2CB_SDA", "I2CB_SCL",
+		"VDDEE_PWM (PWM_D)",
+		/* 36 Bank GPIODV 29 */
+		"",
+
+		/* 37-39 Bank GPIOH 0-2 */
+		"HDMI_HPD", "HDMI_I2C_SDA", "HDMI_I2C_SCL",
+		/* 40-46 Bank GPIOH 3-9 */
+		"ETH_PHY_INTR", "ETH_PHY_NRST",
+		"ETH_TXD1", "ETH_TXD0",
+		"ETH_TXD3", "ETH_TXD2",
+		"ETH_RGMII_TX_CLK",
+
+		/* 47-53 Bank CARD 0-6 */
+		"SD_D1", "SD_D0",
+		"SD_CLK", "SD_CMD",
+		"SD_D3", "SD_D2",
+		"SD_CD",
+
+		/* 54-65 Bank BOOT 0-11 */
+		"EMMC_D0", "EMMC_D1",
+		"EMMC_D2", "EMMC_D3",
+		"EMMC_D4", "EMMC_D5",
+		"EMMC_D6", "EMMC_D7",
+		"EMMC_CLK", "EMMC_RSTn",
+		"EMMC_CMD", "BOOT_SEL",
+		/* 66-72 Bank BOOT 12-18 */
+		"", "",
+		"", "",
+		"", "",
+		"",
+
+		/* 73-74 Bank DIF 0P 0N */
+		"ETH_RXD1", "ETH_RXD0",
+		/* 75-76 Bank DIF 1P 1N */
+		"ETH_RX_DV", "RGMII_RX_CLK",
+		/* 77-78 Bank DIF 2P 2N */
+		"ETH_RXD3", "ETH_RXD2",
+		/* 79-80 Bank DIF 3P 3N */
+		"ETH_TXEN", "ETH_PHY_REF_CLK_25MOUT",
+		/* 81-82 Bank DIF 4P 4N */
+		"ETH_MDC", "ETH_MDIO";
+};
+
+&gpio_ao {
+	gpio-line-names =
+		/* 0-1 GPIOAO 0-1 */
+		"UART TX", "UART RX",
+		/* 2-4 GPIOAO 2-4 */
+		"RED_LED", "GREEN_LED", "BLUE_LED",
+		/* 5 GPIOAO 5 */
+		"BUTTON",
+		/* 6 GPIOAO 6 */
+		"",
+		/* 7 GPIOAO 7 */
+		"IR_IN",
+		/* 8-13 GPIOAO 8-13 */
+		"", "",
+		"", "",
+		"", "",
+
+		/* 14 GPIO_BSD_EN */
+		"",
+		/* 15 GPIO_TEST_N */
+		"";
+};
+
+/*
+ * 100Mbit ethernet over RMII. This is the main hardware difference from
+ * the OneCloud/WS1608, which wires a gigabit PHY over RGMII.
+ * The PHY is probed over MDIO, so no PHY-specific driver is named here.
+ */
+&ethmac {
+	status = "okay";
+
+	pinctrl-0 = <&eth_rmii_pins>;
+	pinctrl-names = "default";
+
+	phy-handle = <&eth_phy>;
+	phy-mode = "rmii";
+
+	mdio {
+		compatible = "snps,dwmac-mdio";
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		eth_phy: ethernet-phy@0 {
+			reg = <0>;
+
+			reset-assert-us = <10000>;
+			reset-deassert-us = <80000>;
+			reset-gpios = <&gpio GPIOH_4 GPIO_ACTIVE_LOW>;
+		};
+	};
+};
+
+&saradc {
+	status = "okay";
+	vref-supply = <&vcc_1v8>;
+};
+
+/*
+ * Internal eMMC.
+ *
+ * The board has ONE combined footprint here that takes either package:
+ * a TSOP-48 land pattern with a BGA ball-field inside it. Early units are
+ * populated with a raw NAND in the TSOP-48 position, later ones with an
+ * eMMC in the BGA position -- both exist within board revision v1.1.
+ *
+ * Mainline Linux cannot drive the raw NAND (there is no meson8b raw-NAND
+ * controller driver in tree; meson_nand.c binds only to gxl and axg). On
+ * a NAND unit this controller simply finds no card and the box roots from
+ * USB or SD instead, which is harmless.
+ */
+&sdhc {
+	status = "okay";
+
+	pinctrl-0 = <&sdxc_c_pins>;
+	pinctrl-names = "default";
+
+	bus-width = <8>;
+	max-frequency = <200000000>;
+
+	cap-mmc-highspeed;
+	mmc-hs200-1_8v;
+	non-removable;
+
+	mmc-pwrseq = <&emmc_pwrseq>;
+
+	vmmc-supply = <&vcc_3v3>;
+};
+
+&sdio {
+	status = "okay";
+
+	pinctrl-0 = <&sd_b_pins>;
+	pinctrl-names = "default";
+
+	/* SD card */
+	sd_card_slot: slot@1 {
+		compatible = "mmc-slot";
+		reg = <1>;
+		status = "okay";
+
+		bus-width = <4>;
+		no-sdio;
+		cap-mmc-highspeed;
+		cap-sd-highspeed;
+		disable-wp;
+
+		cd-gpios = <&gpio CARD_6 GPIO_ACTIVE_LOW>;
+
+		vmmc-supply = <&vcc_3v3>;
+	};
+};
+
+&uart_AO {
+	status = "okay";
+	pinctrl-0 = <&uart_ao_a_pins>;
+	pinctrl-names = "default";
+};
+
+/*
+ * The single USB 2.0 port. It doubles as the Amlogic USB burning port,
+ * so it is left in OTG mode: with nothing driving the ID pin the
+ * controller settles into host mode and USB mass storage works, while
+ * the ROM/u-boot can still use it in device mode for flashing.
+ */
+&usb0_phy {
+	status = "okay";
+	dr_mode = "otg";
+};
+
+&usb0 {
+	status = "okay";
+};
