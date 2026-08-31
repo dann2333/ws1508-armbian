@@ -33,6 +33,14 @@ fi
 
 echo "Try to boot from ${bootdev}"
 
+# Snapshot the bootloader's storage detection before armbianEnv.txt is
+# imported. "env import" without -d overwrites existing definitions
+# (common/cmd_nvedit.c:710), so a "store=" line in a file the user edits
+# would otherwise replace the value set_storage_device_flag() worked out
+# from the hardware - and every decision below that trusts ${store} would
+# be trusting the file instead of the board.
+setenv ws1508_store "${store}"
+
 fatload ${bootdev} 0x11000000 /armbianEnv.txt && env import -t 0x11000000 ${filesize}
 
 if test -n "${rootdev}"; test $? != 0; then
@@ -72,7 +80,7 @@ setenv bootargs "${bootargs} ${extraargs}"
 # answered over SSH instead of needing a soldering iron and a USB-TTL
 # adapter. ${store} is set by set_storage_device_flag() before bootcmd:
 # 1 = NAND, 2 = eMMC, 3 = nothing detected. ws1508-info decodes it.
-setenv bootargs "${bootargs} ws1508.store=${store}"
+setenv bootargs "${bootargs} ws1508.store=${ws1508_store}"
 
 # Booting.
 #
@@ -140,14 +148,14 @@ test -n "${fdtfile}" || setenv fdtfile meson8b-ws1508.dtb
 # Refuse the NAND device tree on a unit whose own bootloader did not find
 # raw NAND. meson8b-ws1508-nand.dts sets &sdhc to disabled, so on an eMMC
 # unit that dtb removes the very controller the rootfs lives behind: the
-# kernel boots and then panics with no root device, and the box is fixed
-# only by putting the card in another machine to edit armbianEnv.txt.
+# kernel boots and then panics with no root device. Recovery is a USB
+# stick (u-boot tries USB first), not a card reader - eMMC is soldered.
 # ${store} is the bootloader's own detection result and costs nothing to
 # consult, so a typo in armbianEnv.txt degrades to "the NAND dtb was
 # ignored" instead of "the box no longer boots". Chained `test ... &&`
 # rather than `if`, matching the form used above; `test -z` is broken in
 # this u-boot.
-test "${fdtfile}" = "meson8b-ws1508-nand.dtb" && test "${store}" != "1" && echo "ws1508: ${fdtfile} needs a raw-NAND unit (store=${store}) - falling back to meson8b-ws1508.dtb" && setenv fdtfile meson8b-ws1508.dtb
+test "${fdtfile}" = "meson8b-ws1508-nand.dtb" && test "${ws1508_store}" != "1" && echo "ws1508: ${fdtfile} needs a raw-NAND unit (store=${ws1508_store}) - falling back to meson8b-ws1508.dtb" && setenv fdtfile meson8b-ws1508.dtb
 
 fatload ${bootdev} 0x16000000 /uImage || exit 1
 fatload ${bootdev} 0x1a800000 /uInitrd || exit 1

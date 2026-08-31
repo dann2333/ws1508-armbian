@@ -250,18 +250,23 @@ dd if=/dev/mmcblk1 of=/mnt/backup/ws1508-emmc.img bs=4M status=progress
 
 ### NAND 版：能做的只有诊断样本，**没有**可用的原厂备份路径
 
-NAND 版没有块设备。实验性的 NAND 设备树能给出一个 `/dev/mtd0`
-（在 `/boot/armbianEnv.txt` 里加 `fdtfile=meson8b-ws1508-nand.dtb` 重启），
-`ws1508-nand-probe` 也能从它 dump 出开头 100 个块：
+NAND 版没有块设备。实验性的 NAND 设备树**如果**能认出这颗芯片，
+会给出一个 `/dev/mtd0`（在 `/boot/armbianEnv.txt` 里加
+`fdtfile=meson8b-ws1508-nand.dtb` 重启）——「如果」是认真的，这个驱动
+从来没在 meson8b 芯片上跑过，`nand_scan()` 枚举不出来是预期结果之一。
+真出来了，`ws1508-nand-probe` 能从它 dump 一段出来：
 
 ```bash
-sudo ws1508-nand-probe          # 只读；会问你要不要 dump 开头 100 个块
+sudo ws1508-nand-probe          # 只读；会问你要不要 dump
 ```
 
-或者手动：
+它的长度不是拍脑袋的：按芯片自报的擦除块大小，算出至少盖满驱动写保护那
+16MiB 需要多少个块（块太大时兜底 100 个块），这样才不会停在厂商保留区中间。
+手动做也一样：
 
 ```bash
-sudo nanddump --bb=dumpbad --length=$((100 * $(cat /sys/class/mtd/mtd0/erasesize))) \
+sudo nanddump --bb=dumpbad \
+              --length=$((16 * 1024 * 1024)) \
               --file=/mnt/backup/ws1508-nand-head.bin /dev/mtd0
 ```
 
@@ -283,9 +288,12 @@ sudo nanddump --bb=dumpbad --length=$((100 * $(cat /sys/class/mtd/mtd0/erasesize
 > 用 `--bb=dumpbad` 不要用 `skipbad`：出厂坏块本身就是要看的信息，
 > 跳过它会把后面所有偏移都错开。
 >
-> 另外注意 dump 的长度：写保护是按芯片自报的几何算出来的
-> （前 1024 页 + 64 个块），和这里固定的 100 个块不是同一个数。
-> 出厂坏块多的机器上，100 个块可能读不到厂商保留区的尾巴。
+> 关于长度：驱动的写保护边界取两个值里大的那个 —— 按芯片自报的几何算出的
+> 「前 1024 页 + 64 个块」，和写死的 16MiB 下限
+> （`MESON8_VENDOR_MIN_BYTES`）。上面用 16MiB 是取那个下限，
+> 芯片几何大的话真实边界会更靠后。厂商保留区是按**好块**计数的，
+> 出厂坏块多的机器上它整体往上浮，所以 16MiB 仍然可能读不到它的尾巴 ——
+> 想稳一点就照着 `/sys/class/mtd/mtd0/erasesize` 把长度再放大一些。
 
 ---
 

@@ -146,7 +146,7 @@ cat /proc/cmdline | tr ' ' '\n' | grep ws1508.store
 准确的分界线是：
 
 - 引导程序**没有文件系统层**。`CONFIG_NEXT_NAND`
-  （`uboot/configs/m8b_ws1508.h:137`）让 Amlogic 的 `Makefile` 把
+  （`uboot/configs/m8b_ws1508.h:153`）让 Amlogic 的 `Makefile` 把
   `drivers/mtd/libmtd.o` 和 `drivers/mtd/nand/libnand.o` 从构建里踢掉
   （`Makefile:216-226`），所以 `fatload` 不可能从 NAND 上的某个文件系统里
   读出 uImage。
@@ -173,14 +173,26 @@ cat /proc/cmdline | tr ' ' '\n' | grep ws1508.store
 **先确认你这台是 NAND 版。** 跑 `ws1508-info`，只有它报
 `store: raw NAND` 才往下走。
 
-> ⚠️ 在 **eMMC 版**机器上加这一行会把机器搞成起不来：这个设备树把
-> `&sdhc` 关了，`mmcblk1` 会整个消失，而 eMMC 上装了系统的机器
-> 根文件系统就在那上面 —— 内核会一直卡在 `rootwait`。
-> 更麻烦的是那行 `fdtfile=` 写在 eMMC 的 boot 分区里，
-> 系统起不来就改不了。
-> 救法：做一张启动 U 盘插上（U-Boot 是 USB 优先），从 U 盘进系统，
-> 挂上 `/dev/mmcblk1p1` 把那一行删掉。SD 卡槽走的是另一个控制器
-> （`&sdio`），这个设备树不动它，所以 SD 卡也能救。
+> 加错了不会把机器搞成起不来：`boot-ws1508.cmd` 会拿 U-Boot 自己的探测结果
+> `${store}` 卡一道，只有 `store=1`（裸 NAND）才放行这个设备树，否则打一行
+> `... needs a raw-NAND unit (store=...) - falling back to meson8b-ws1508.dtb`
+> 然后退回 eMMC 设备树照常启动。`store=3`（U-Boot 什么都没探测到）也一样挡回去。
+>
+> 这道闸没法用 `armbianEnv.txt` 绕开：启动脚本在 `env import` **之前**就先把
+> U-Boot 的探测值抄进 `${ws1508_store}`，而 `env import` 不带 `-d` 是覆盖式的
+> （`common/cmd_nvedit.c:710`）—— 在 `armbianEnv.txt` 里写 `store=1` 只改得掉
+> `${store}`，改不掉判断用的那一份，传给内核的 `ws1508.store=` 也仍然是硬件
+> 的真实结果。
+>
+> 之所以要有这道闸：这个设备树把 `&sdhc` 关了，`mmcblk1` 会整个消失，
+> 而 eMMC 上装了系统的机器根文件系统就在那上面，内核会一直卡在 `rootwait`；
+> 那行 `fdtfile=` 又写在 eMMC 的 boot 分区里，系统起不来就改不了。
+> 现在这条路走不到了，代价是「设备树被忽略」而不是「机器不启动」。
+>
+> 注意这道闸在**本项目的 `boot.scr`** 里。用别的启动脚本（比如社区的
+> 玩客云底包）就没有这层保护，那时上面那段仍然成立：救法是做一张启动 U 盘
+> 插上（U-Boot 是 USB 优先），从 U 盘进系统挂上 `/dev/mmcblk1p1` 把那行删掉。
+> SD 卡槽走的是另一个控制器（`&sdio`），这个设备树不动它，所以 SD 卡也能救。
 
 确认是 NAND 版之后，在 `/boot/armbianEnv.txt` 里加一行，然后重启：
 
@@ -194,20 +206,27 @@ NAND 总线和 sdxc_c 总线共用的，两个控制器不可能同时开），�
 SD 卡槽在 `&sdio` 上，不受影响。
 
 开起来之后跑 `ws1508-nand-probe`：它只读，会打印几何参数、时钟频率、
-中断计数，也可以把开头 100 个块 dump 成文件。
+以及 `/proc/interrupts` 里有没有这个控制器（**预期是没有**，设备树里
+根本没写 `interrupts`，见下面「已知没验证过的地方」）。
+它也可以 dump 一段出来：长度按芯片自报的擦除块大小算，至少盖满
+驱动写保护的那 16MiB，块数太少时兜底 100 个块。
 如果压根没有 `/dev/mtd0`，那也是一种结果，见下面「已知没验证过的地方」。
 
 默认是**只读**的。要写必须显式加 `meson_nand.allow_write=1`，
-而且即便加了，驱动仍然会挡掉落在厂商引导区里的擦写请求
-（前 1024 页 + 64 个块，数值是从芯片自己上报的页/块大小算出来的）。
-这道保护本身也**没有在实机上验证过**。
+而且即便加了，驱动仍然会挡掉落在厂商引导区里的擦写请求。
+边界取两个值里大的那个：按芯片自己上报的页/块大小算出来的
+「前 1024 页 + 64 个块」，和一个写死的 **16MiB 下限**
+（`MESON8_VENDOR_MIN_BYTES`，见 `ws1508-0102-*.patch`）。
+这道保护本身**没有在实机上验证过**。
 
 > ⚠️ 镜像里装了 `mtd-utils`（`ws1508-nand-probe` 要用它的 `nanddump`）。
 > Debian / Ubuntu 是一个合并的包，所以 `flash_erase`、`nandwrite`、
 > `nandtest`、`ubiformat` 也一并装进来了 —— 内核没开 `MTD_UBI` 挡不住
 > `ubiformat`，它是直接对 `/dev/mtdN` 发 `MEMERASE` / `MEMWRITE`。
-> **别把这些工具指向 `/dev/mtd0`。** 内核里那道写保护是唯一的拦阻，
-> 而它没在实机上验证过。要读就只用 `nanddump`。
+> **别把这些工具指向 `/dev/mtd0`。** 拦着它们的只有驱动里那两道：
+> 不加 `meson_nand.allow_write=1` 时整个 MTD 是只读的，
+> 以及厂商引导区那道无论如何都不放行的地址闸。
+> 两道都没在实机上验证过。要读就只用 `nanddump`。
 
 ### 开之前
 
@@ -236,13 +255,23 @@ SD 卡槽在 `&sdio` 上，不受影响。
 
 关于内存踩踏：2019 年那次移植是靠 `CONFIG_SLUB_DEBUG_ON=y` 才发现 DMA
 越界的，不开的话内存被踩了也不报，要等到某个不相干的 `kfree()` 炸掉才知道。
-**但发布镜像的内核没有开这个选项**，所以「先弄一个带 SLUB debug 的内核」
-不是照着上面那条一行开启法就能做到的事。两条现实的路：
+**但发布镜像的内核没有开这个选项**。两条现实的路：
 
-- 自己本地编译：在 `userpatches/extensions/ws1508-nand.sh` 的
-  `custom_kernel_config__ws1508_nand()` 里加
-  `kernel_config_set_y SLUB_DEBUG` 和 `kernel_config_set_y SLUB_DEBUG_ON`，
-  再按 README 的「本地编译」编一版。这条路本项目没有实际跑过。
+- 自己本地编译，带上 `WS1508_NAND_SLUB_DEBUG=yes`：
+
+  ```bash
+  sudo -E WS1508_NAND_SLUB_DEBUG=yes bash scripts/build-armbian.sh build
+  ```
+
+  `userpatches/extensions/ws1508-nand.sh` 认这个变量，会顺手打开
+  `SLUB_DEBUG` 和 `SLUB_DEBUG_ON`。注意它是**编译主机上的环境变量**，
+  走的不是 `WS1508_ROOT_PASSWORD` 那些经 `overlay/ws1508-build.conf`
+  传进 chroot 的通道 —— 所以得让它一路传到 `compile.sh`（上面的 `sudo -E` 就是干这个的）。
+  **不要自己去改那个函数体**：
+  扩展同时把这两个符号塞进了 `kernel_config_modifying_hashes`，
+  Armbian 靠它算内核产物的版本哈希 —— 手改函数体绕过这一步，
+  debug 内核就可能直接复用普通内核缓存好的 `.deb`，白编一遍。
+  这条路本项目没有实际跑过。
 - 用发布镜像：那就把判据换掉 —— 开了这个设备树之后，
   内核**任何**莫名其妙的 oops（哪怕调用栈里和 NAND 毫无关系）
   都先按 DMA 越界处理并反馈，别当成不相干的问题排查。
@@ -286,17 +315,36 @@ amlnf chipinfo
 - **就算出来了，读到的内容也可能是错的。** 厂商写过的页用硬件 ECC 读回来
   纠不动，是 ECC 强度 / 加扰器设置还没对上的**预期结果**，
   不能直接当成「闪存坏了」。设备树里 ECC 故意没写死，就是等实机数据。
-- 中断号 GIC_SPI 34 是从 Amlogic 的头文件里读出来的，没有实测过。
-  所以驱动默认**不用中断**，用软件轮询等 ready（厂商自己的 m8 驱动也是
-  无条件走这条路的）。想试中断加 `meson_nand.use_irq_rb=1`。
-- 那个 DMA 越界至今没有官方解释。这里要说明来源：
-  「2019 年在 Meson8m2 上移植时报给 Amlogic、其 NFC 作者转给了内部 VLSI 团队、
-  一直没有回音，256 字节够用、512 字节看不到更多」这一串说法是
-  **转述的二手信息，本项目没有复现过，也没有找到可引用的邮件列表存档链接**。
-  补丁的做法是给它一整页，属于对着一个没有文档的硬件行为下的保守猜测。
-- 厂商引导区写保护的边界（前 1024 页 + 64 个块）是按芯片**自报**的
-  页/块大小算出来的。如果 `nand_scan()` 把几何认小了，这个边界会跟着缩水，
-  而真实的厂商区不会。
+- **中断号是个未知数，所以设备树里干脆没写。** `ws1508-0104` 给
+  `meson8b.dtsi` 加的那个 nfc 节点**没有 `interrupts` 属性**，
+  于是 `platform_get_irq_optional()` 返回 `-ENXIO`，`use_soft_waitrdy`
+  保持为真，驱动用软件轮询等 ready —— 厂商自己的 m8 驱动也是无条件走这条路的，
+  这是目前唯一有依据的行为。
+  跟着来的一条：在本项目发的 dtb 上加 `meson_nand.use_irq_rb=1`
+  **什么都不会发生**，没有中断号可用，那个参数只在设备树里真有
+  `interrupts` 时才起作用。想试中断，得先在自己的 `.dts` 里把属性加上，
+  再带这个参数启动，然后看 `/proc/interrupts` 里的计数涨不涨。
+- **info DMA 缓冲区到底该多大，没有官方说法。** 已知的只有一件事：
+  Amlogic 自己的 m8 驱动给这个缓冲区留了余量 ——
+  `buf_size = (pagesize / ecc_unit) * PER_INFO_BYTE; buf_size += 16;`
+  （`work/uboot-nand/drivers/amlnf/phy/chip.c:233-234`）。
+  厂商在自己的硅片上给自己的分配打了 16 字节的补丁，这正是怀疑主线那份
+  「按 `ecc.steps` 精确分配」会被控制器写越界的理由。
+  `ws1508-0100` 就照抄这个尺寸：按最小 ECC 单元（512 字节）算出的最大扇区数
+  乘 `PER_INFO_BYTE`，再加厂商那 16 字节。2K 页 / 1K ECC 步长的话是
+  `4*8+16 = 48` 字节，不是一整页。（「给它一整页」是本文档早先版本的说法，
+  那个做法已经不在补丁里了。）
+  另有一串**转述的二手信息**（「2019 年在 Meson8m2 上移植时报给 Amlogic、
+  其 NFC 作者转给了内部 VLSI 团队、一直没有回音，256 字节够用、
+  512 字节看不到更多」）：本项目没有复现过，也没有找到可引用的邮件列表存档，
+  而且它和 Amlogic 自己的代码互相矛盾，所以**故意没有**写进分配里。
+  真在 M8 硅片上撞到 slab 破坏，这里是第一个该看的地方。
+- 厂商引导区写保护的边界按芯片**自报**的页/块大小算（前 1024 页 + 64 个块），
+  几何认小了它就会跟着缩水 —— 所以 `ws1508-0102` 给它加了
+  `MESON8_VENDOR_MIN_BYTES = 16MiB` 的下限，取两者的较大值，
+  再怎么认错也不会缩到 16MiB 以下。这一条现在**是有对策的**，
+  不再是敞着的风险；剩下的未知是这个下限够不够 —— 它只保证盖住
+  4×256 个引导页，盖不盖得住随坏块上浮的厂商保留区尾巴，还要实机数据。
 
 ---
 

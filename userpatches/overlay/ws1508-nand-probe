@@ -93,9 +93,14 @@ for c in nand_clk_gate nand_clk_div nand_clk_sel; do
 done
 [ -r /sys/kernel/debug/clk/nand_clk_gate/clk_rate ] || \
 	echo "  (mount debugfs to see these: mount -t debugfs none /sys/kernel/debug)"
-echo "  For reference: the vendor bootloader runs this at ~212.6 MHz and"
-echo "  the boot ROM leaves it at ~159.4 MHz. Anything in the 60-260 MHz"
-echo "  band off a parent the clock driver knows means the path works."
+# Derived, not measured: amlnf_ctrl.c programs nand_clk_sel/div directly and
+# drivers/clk/meson/meson8b.c says what those settings mean.
+echo "  For reference (derived from the vendor's own divider settings plus"
+echo "  mainline's meson8b clock tree, NOT measured on hardware): the rate"
+echo "  the vendor driver calls 212 is fclk_div3 850MHz / 4 = 212.5 MHz, and"
+echo "  the one it calls 160 is fclk_div4 637.5MHz / 4 = 159.4 MHz."
+echo "  Anything in the 60-260 MHz band off a parent the clock driver knows"
+echo "  means the path works."
 
 info "Interrupt"
 # Expected to find nothing. meson8b.dtsi gives the NFC node no "interrupts"

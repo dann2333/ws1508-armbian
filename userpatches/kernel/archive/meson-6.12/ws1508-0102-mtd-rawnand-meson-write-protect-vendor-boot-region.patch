@@ -32,22 +32,27 @@ geometry.
 Getting the guard onto every path that can modify the chip takes five
 hooks, not one, because mtd->_erase is not the only way in:
 
-  meson_nfc_exec_op()        refuses NAND_CMD_ERASE1 and NAND_CMD_SEQIN
-                             whose row address
-                             falls inside the region. This is the
-                             innermost gate and the only one nand_base
-                             cannot walk around:
+  meson_nfc_exec_op()        refuses a NAND_CMD_ERASE1 or NAND_CMD_SEQIN
+                             whose row address falls inside the region.
+                             This is the innermost gate and the only one
+                             nand_base cannot walk around:
                              nand_block_markbad_lowlevel() calls
                              nand_erase_nand() DIRECTLY rather than
                              through mtd->_erase, so with only an
                              ->_erase wrapper a MEMSETBADBLOCK ioctl on
                              block 0 erases the bootloader -- which is
                              exactly what "nandtest --markbad" issues
-                             after an erase is refused. ERASE1 reaches
-                             the chip only from nand_erase_op(), which
-                             always emits it as a CMD followed by a
-                             row-address-only ADDR, so the block is
-                             recoverable here exactly.
+                             after an erase is refused. Both opcodes
+                             carry the row the same way and both reach
+                             the chip from exactly one place:
+                             nand_erase_op() emits ERASE1 as a CMD plus
+                             a row-address-only ADDR, and
+                             nand_exec_prog_page_op() emits SEQIN with
+                             the two column cycles of
+                             nand_fill_column_cycles() ahead of the row.
+                             So the target block is recoverable here
+                             exactly, by skipping two cycles for SEQIN
+                             and none for ERASE1.
 
   mtd->_block_markbad        refuses before nand_block_markbad_lowlevel()
                              is entered at all, so the caller gets
@@ -183,7 +188,7 @@ diff --git a/drivers/mtd/nand/raw/meson_nand.c b/drivers/mtd/nand/raw/meson_nand
  	meson_nfc_select_chip(nand, nand->cur_cs);
  
  	data_len =  mtd->writesize + mtd->oobsize;
-@@ -1181,6 +1236,56 @@
+@@ -1181,6 +1236,61 @@
  	if (check_only)
  		return 0;
  
@@ -214,7 +219,12 @@ diff --git a/drivers/mtd/nand/raw/meson_nand.c b/drivers/mtd/nand/raw/meson_nand
 +				skip = 0;
 +				break;
 +			case NAND_CMD_SEQIN:
-+				skip = 2;
++				/*
++				 * nand_fill_column_cycles() emits one column
++				 * cycle on a small-page chip and two otherwise,
++				 * so the row does not start at a fixed index.
++				 */
++				skip = nand_to_mtd(nand)->writesize <= 512 ? 1 : 2;
 +				break;
 +			default:
 +				continue;
@@ -240,7 +250,7 @@ diff --git a/drivers/mtd/nand/raw/meson_nand.c b/drivers/mtd/nand/raw/meson_nand
  	meson_nfc_select_chip(nand, op->cs);
  	for (op_id = 0; op_id < op->ninstrs; op_id++) {
  		instr = &op->instrs[op_id];
-@@ -1542,6 +1647,36 @@
+@@ -1542,6 +1652,36 @@
  	meson_nfc_free_buffer(nand);
  }
  
@@ -277,7 +287,7 @@ diff --git a/drivers/mtd/nand/raw/meson_nand.c b/drivers/mtd/nand/raw/meson_nand
  static int meson_nand_attach_chip(struct nand_chip *nand)
  {
  	struct meson_nfc *nfc = nand_get_controller_data(nand);
-@@ -1590,6 +1725,17 @@
+@@ -1590,6 +1730,17 @@
  		return -EOPNOTSUPP;
  	}
  
@@ -295,7 +305,7 @@ diff --git a/drivers/mtd/nand/raw/meson_nand.c b/drivers/mtd/nand/raw/meson_nand
  	if (nand->bbt_options & NAND_BBT_USE_FLASH)
  		nand->bbt_options |= NAND_BBT_NO_OOB;
  
-@@ -1624,6 +1770,20 @@
+@@ -1624,6 +1775,20 @@
  	nand->ecc.write_oob_raw = nand_write_oob_std;
  	nand->ecc.write_oob = nand_write_oob_std;
  
@@ -316,7 +326,7 @@ diff --git a/drivers/mtd/nand/raw/meson_nand.c b/drivers/mtd/nand/raw/meson_nand
  	nand->ecc.read_page_raw = meson_nfc_read_page_raw;
  	nand->ecc.read_page = meson_nfc_read_page_hwecc;
  	nand->ecc.read_oob_raw = meson_nfc_read_oob_raw;
-@@ -1652,6 +1812,42 @@
+@@ -1652,6 +1817,42 @@
  	return ret;
  }
  
@@ -359,7 +369,7 @@ diff --git a/drivers/mtd/nand/raw/meson_nand.c b/drivers/mtd/nand/raw/meson_nand
  static const struct nand_controller_ops meson_nand_controller_ops = {
  	.attach_chip = meson_nand_attach_chip,
  	.detach_chip = meson_nand_detach_chip,
-@@ -1721,6 +1917,31 @@
+@@ -1721,6 +1922,31 @@
  	if (ret)
  		return ret;
  

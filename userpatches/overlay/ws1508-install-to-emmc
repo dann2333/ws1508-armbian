@@ -11,7 +11,8 @@
 # It never touches the bootloader area (the first 16MiB), so the u-boot
 # you flashed with the USB Burning Tool stays exactly where it is.
 #
-# Only works on eMMC units, and that is not going to change.
+# Only works on eMMC units. This installer is not the place to change
+# that - see the note below for what a NAND unit can and cannot do.
 #
 # A raw-NAND unit running the NAND device tree is EXPECTED to get a
 # /dev/mtd0 from the kernel -- "expected" because that driver has never

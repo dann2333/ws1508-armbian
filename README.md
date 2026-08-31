@@ -102,7 +102,7 @@ ssh root@<设备IP>        # 也可以试 ssh root@ws1508.local
 
 ### 引导程序读得到 NAND
 
-本项目的 U-Boot 开了 `CONFIG_NEXT_NAND`（`uboot/configs/m8b_ws1508.h:137`），
+本项目的 U-Boot 开了 `CONFIG_NEXT_NAND`（`uboot/configs/m8b_ws1508.h:153`），
 这个宏同时做了两件方向相反的事：
 
 - 它把 `drivers/mtd/libmtd.o` 和 `drivers/mtd/nand/libnand.o` 从构建里踢掉
@@ -145,6 +145,9 @@ meson8/meson8b 加了进去（原本只认 `amlogic,meson-gxl-nfc` 和
 `amlogic,meson-axg-nfc`）。默认**不启用**；在 `/boot/armbianEnv.txt` 里加
 `fdtfile=meson8b-ws1508-nand.dtb` 重启之后，**如果驱动认得出这颗芯片**，
 NAND 版机器上会出现一个**只读**的 `/dev/mtd0`。
+
+在 eMMC 版机器上误加这一行不会把机器搞死：启动脚本会拿 U-Boot 自己探测到的
+`${store}` 卡一道，不是裸 NAND 就打一行提示、退回 eMMC 设备树继续启动。
 
 「如果」两个字是认真的：主线 meson-nand **从来没有在 meson8b 芯片上跑过**，
 本项目也没有实机。预期之内的结果包括：`nand_scan()` 根本枚举不出芯片、
@@ -245,6 +248,7 @@ userpatches/
     ws1508-0103-*.patch       dt-bindings: amlogic,meson-nand.yaml 加两个 compatible
     ws1508-0104-*.patch       arch/arm/boot/dts/amlogic/meson8b.dtsi 加 NFC 节点和引脚
   extensions/ws1508-nand.sh   打开 MTD / 裸 NAND 的内核配置
+                              （编译时带 WS1508_NAND_SLUB_DEBUG=yes 可加 SLUB 调试）
   customize-image.sh          SSH 自启 + 512MB 调优
   overlay/ws1508-install-to-emmc  在机器上把系统装进 eMMC（自己写 MBR）
   overlay/ws1508-nand-probe   裸 NAND 只读诊断 / dump 工具

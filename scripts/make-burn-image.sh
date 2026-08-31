@@ -19,9 +19,12 @@
 # uboot/m8b_ws1508/firmware/storage.c).
 #
 # NOTE: writing boot+rootfs to internal storage only produces a bootable
-# system on eMMC units. On a raw-NAND unit mainline Linux cannot read the
-# root filesystem back, so those users should flash the bootloader-only
-# package (ws1508-uboot.burn.img) and boot from USB or SD instead.
+# system on eMMC units. Nothing here can root a raw-NAND unit off its
+# internal flash: the partitions this writes are the vendor bootloader's,
+# in a layout only its own NFTL understands, and neither u-boot nor Linux
+# has a filesystem on top of it. (Not a hardware limit - see README - but
+# it is not something this packer can paper over.) NAND users should flash
+# the bootloader-only package, ws1508-uboot.burn.img, and boot from USB.
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 

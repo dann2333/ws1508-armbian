@@ -9,7 +9,10 @@
  *
  * in /boot/armbianEnv.txt on a unit whose bootloader reports ws1508.store=1.
  * On an eMMC unit this dtb disables the controller the root filesystem is
- * on, so run "ws1508-info" and confirm it says "raw NAND" first.
+ * on, so run "ws1508-info" and confirm it says "raw NAND" first. This
+ * project's boot.scr checks ${store} for the same reason and falls back to
+ * meson8b-ws1508.dtb rather than loading this one on a non-NAND unit, but
+ * that check lives in the boot script, not in this file.
  *
  * READ THIS BEFORE USING IT:
  *
@@ -26,13 +29,15 @@
  *     things are true and they are often conflated:
  *
  *       * The bootloader CAN read raw NAND. Our u-boot config defines
- *         CONFIG_NEXT_NAND, which drops libmtd.o and libnand.o from the
- *         build, so there is no MTD layer and no filesystem layer over
- *         the flash -- "fatload" from NAND is impossible. But
- *         common/store_interface.c is linked unconditionally and gives
- *         "store read <name> <addr> <off> <size>", which dispatches to
- *         the amlnf driver's "amlnf read_byte" on a NAND unit. That is
- *         how the vendor 3.10 firmware boots from internal flash.
+ *         CONFIG_NEXT_NAND. That one macro cuts both ways: it drops
+ *         libmtd.o and libnand.o from the build (vendor Makefile:216-226),
+ *         so there is no MTD layer and no filesystem layer over the
+ *         flash and "fatload" from NAND is impossible -- but the same
+ *         macro pulls in common/store_interface.o (common/Makefile:173-176),
+ *         which gives "store read <name> <addr> <off> <size>". On a NAND
+ *         unit that dispatches to the amlnf driver's "amlnf read_byte"
+ *         (store_interface.c:293-311). That is how the vendor 3.10
+ *         firmware boots from internal flash.
  *
  *       * This project's boot script only ever fatloads from usb/sd/mmc,
  *         so nothing here uses that path, and Linux still has no way to

@@ -89,6 +89,13 @@ fi
 # changes behaviour in ways that break a plain `compile.sh` invocation.
 export GITHUB_ACTIONS=false
 
+# Read on the build host by custom_kernel_config__ws1508_nand() in
+# userpatches/extensions/ws1508-nand.sh, not inside the chroot - so unlike
+# the other WS1508_* knobs it does not belong in ws1508-build.conf. Export
+# it explicitly rather than leaving it to ambient inheritance through sudo,
+# which strips the environment unless -E was used.
+export WS1508_NAND_SLUB_DEBUG="${WS1508_NAND_SLUB_DEBUG:-no}"
+
 COMMON_ARGS=(
 	ALLOW_ROOT=yes
 	BOARD="${BOARD}"

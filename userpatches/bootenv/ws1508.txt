@@ -41,9 +41,13 @@ console="both"
 #     fdtfile=meson8b-ws1508-nand.dtb
 #
 #   It is EXPERIMENTAL and only makes sense on a unit where
-#   'ws1508-info' reports "store: raw NAND". Check that FIRST: on an
-#   eMMC unit this dtb disables the controller the rootfs lives on and
-#   the box will hang in rootwait. What it does:
+#   'ws1508-info' reports "store: raw NAND". Setting it on any other
+#   unit is a no-op rather than a brick: boot.scr checks the
+#   bootloader's own ${store} detection and, on anything that is not
+#   raw NAND, prints a line saying so and loads meson8b-ws1508.dtb
+#   instead. The check exists because this dtb disables the controller
+#   an eMMC unit's rootfs lives on, and the resulting rootwait hang
+#   would leave this very file unreachable. What it does:
 #     - disables the eMMC controller (&sdhc). Those are the same BOOT_x
 #       pads as the NAND bus, so the two can never both be enabled. On a
 #       NAND unit there is nothing on them to lose. The SD card slot is
@@ -64,13 +68,18 @@ console="both"
 #       dtb come off USB or SD.
 #     - it does not give you writable internal storage. The MTD is
 #       read-only unless you also add meson_nand.allow_write=1 to
-#       extraargs, and even then the driver rejects erase/program
-#       requests that land in the vendor bootloader region. That guard
-#       is untested on hardware like everything else here, and the image
-#       does ship mtd-utils (nanddump's package also carries
-#       flash_erase, nandwrite, nandtest and ubiformat), so it is the
-#       only thing standing between those tools and the boot region.
-#       Point nothing but nanddump at /dev/mtd0.
+#       extraargs. There are two barriers, not one: without that
+#       parameter the whole MTD is read-only, and the address guard
+#       refuses four operations inside the vendor bootloader region
+#       whatever the parameter says - erase, program, OOB write and
+#       mark-bad. The mark-bad one matters most: nand_block_markbad
+#       reaches nand_erase_nand() without passing mtd->_erase, so it is
+#       how "nandtest --markbad" would otherwise erase block 0 after an
+#       erase is refused. Both barriers are untested on hardware like
+#       everything else here, and the image does ship mtd-utils
+#       (nanddump's package also carries flash_erase, nandwrite,
+#       nandtest and ubiformat). Point nothing but nanddump at
+#       /dev/mtd0.
 #
 #   Before you try it: have a working Amlogic USB Burning Tool setup.
 #   That is the only unbrick path, and it restores firmware but NOT the
@@ -84,7 +93,10 @@ console="both"
 #   possible at all, has to be taken with the vendor u-boot's
 #   amlnf/store commands over the serial console.
 #
-#   If it does not boot, put the USB stick back in and delete this line.
+#   If the box comes up on meson8b-ws1508.dtb anyway, read the boot log
+#   or dmesg: boot.scr refused this line because ${store} did not say
+#   raw NAND. If it does not come up at all, put the USB stick back in
+#   and delete this line.
 # fdtfile=meson8b-ws1508-nand.dtb
 
 # The following contents are auto-generated.
