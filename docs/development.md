@@ -358,8 +358,11 @@ eMMC 版刷完 `.burn.img`、拔掉 U 盘、通电，等 2 分钟：
   这样也不用赌到底哪个是对的；
 - eMMC 的 `max-frequency = <200000000>` 和 `mmc-hs200-1_8v` 沿用社区设备树。
   如果实机 eMMC 不稳定，先把这两项降下来试；
-- 完整 `.burn.img` 在 NAND 版机器上的行为（预期：引导能写，
-  boot/rootfs 白写，最后还是从 U 盘启动）。
+- 完整 `.burn.img` 在 NAND 版机器上的行为。这条在 NAND 启动做出来之后
+  变了：`boot` 现在装的是 NAND 内核，被 eMMC 那个包里的 FAT 分区镜像盖掉
+  就不再是「白写」而是破坏；`rootfs` 那个 ext4 落在 UBI 的物理区域上。
+  而且不勾擦除时它根本刷不进去（`store init 1` 过不了分区表校验）。
+  预期行为见 flashing.md 的 FAQ —— **NAND 版不要刷这个包**。
 
 ### meson8b 裸 NAND 驱动：树里目前最大的一块没验证过的东西
 
