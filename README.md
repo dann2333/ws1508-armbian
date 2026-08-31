@@ -9,7 +9,7 @@
 
 > WS1508 同时存在 **NAND** 和 **eMMC** 两种版本（连同一块 v1.1 主板都有两种），
 > 本项目对两种都做了适配，但**能做到的程度不一样**，
-> 原因见下面「NAND 版为什么不能把系统装进内置存储」。
+> 原因见下面「NAND 版：为什么现在还不能从内置存储启动」。
 
 ---
 
@@ -95,15 +95,67 @@ ssh root@<设备IP>        # 也可以试 ssh root@ws1508.local
 
 ---
 
-## NAND 版为什么不能把系统装进内置存储
+## NAND 版：为什么现在还不能从内置存储启动
 
-主线 Linux **没有** S805（meson8b）的裸 NAND 控制器驱动 ——
-内核里的 `drivers/mtd/nand/raw/meson_nand.c` 只认 `amlogic,meson-gxl-nfc`
-和 `amlogic,meson-axg-nfc`，meson8b 不在其中。
-所以 NAND 版机器上，Linux 根本读不到内置存储，根文件系统只能放在 U 盘或 SD 卡。
+这一节以前写错过，现在按代码重写。要分开的是两件常被混在一起的事：
+**引导程序读不读得到 NAND**，和**本项目有没有实现从 NAND 启动**。
 
-能做到的是：**把 U-Boot 刷进 NAND**（U-Boot 自己带 Amlogic 的 `amlnf` 驱动，
+### 引导程序读得到 NAND
+
+本项目的 U-Boot 开了 `CONFIG_NEXT_NAND`（`uboot/configs/m8b_ws1508.h:137`），
+这个宏同时做了两件方向相反的事：
+
+- 它把 `drivers/mtd/libmtd.o` 和 `drivers/mtd/nand/libnand.o` 从构建里踢掉
+  （厂商 U-Boot `Makefile:216-226`）。所以引导程序里**没有文件系统层**，
+  `fatload` 不可能从 NAND 上的某个文件系统里读出 uImage；
+- 但同一个宏又把 `common/store_interface.o` 编了进去
+  （`common/Makefile:173-176`）。`store read <名字> <内存地址> <偏移> <长度>`
+  在 `device_boot_flag` 是 NAND 时会转成 `amlnf read_byte` 下去
+  （`common/store_interface.c:293-311`），命令自带的用法说明写的就是
+  「read 'size' bytes … skipping bad blocks」（同文件 `:938`）。
+  `amlnf read` / `amlnf chipinfo` 也都在（`drivers/amlnf/dev/cmd_amlnf.c`）。
+
+也就是说：**按裸偏移读 NAND，引导程序做得到**——厂商 3.10 固件正是这么从
+内置 NAND 启动的。缺的是文件系统那一层，不是读闪存的能力。
+
+### 缺口在本项目这一侧：没做，不是做不了
+
+1. **没有走 `store read` 的启动路径。**
+   `userpatches/bootscripts/boot-ws1508.cmd` 从头到尾只有
+   `fatload ${bootdev} …`，只认 usb / sd / mmc。要从内置 NAND 引导，
+   得另写一个用 `store read` 把 uImage / uInitrd / dtb 从裸偏移读进内存
+   再 `bootm` 的启动脚本，还得有一份和厂商分区表对得上的偏移。
+   本仓库没有这个东西，也没有在实机上试过。
+2. **根文件系统没有着落。**
+   内置闪存上是厂商的 NFTL 布局，主线 Linux 没有能挂上去的驱动。
+   想在上面放 UBI 就得动厂商保留区，而那块区域丢了补不回来（见下文）。
+   理论上还可以整个塞进 initramfs 全内存跑，但这机器只有 512MB，
+   那是另一个问题了。
+
+所以准确的说法是：**这条路本项目没有实现、也没有验证过**，
+而不是引导那一端原理上读不到 NAND。想接着做的人，上面两条就是入口。
+
+现在能做到的是：把 U-Boot 刷进 NAND（U-Boot 自己带 Amlogic 的 `amlnf` 驱动，
 读写 NAND 没问题），然后由它去 U 盘/SD 卡上把系统引导起来。
+
+### 内核这边：有一个实验性的只读驱动
+
+本项目给主线的 `drivers/mtd/nand/raw/meson_nand.c` 打了补丁，把
+meson8/meson8b 加了进去（原本只认 `amlogic,meson-gxl-nfc` 和
+`amlogic,meson-axg-nfc`）。默认**不启用**；在 `/boot/armbianEnv.txt` 里加
+`fdtfile=meson8b-ws1508-nand.dtb` 重启之后，**如果驱动认得出这颗芯片**，
+NAND 版机器上会出现一个**只读**的 `/dev/mtd0`。
+
+「如果」两个字是认真的：主线 meson-nand **从来没有在 meson8b 芯片上跑过**，
+本项目也没有实机。预期之内的结果包括：`nand_scan()` 根本枚举不出芯片、
+压根没有 `/dev/mtd0`；或者出来了，但读厂商写过的页全是 ECC 纠不回来。
+在 ECC 强度和加扰器设置被确认对得上之前，后一种是**预期结果**，不是驱动坏了。
+
+它的用处是把内置闪存**读**出来，看驱动读得对不对；不是让系统跑在上面。
+默认关闭、默认只读，驱动还会挡掉落在厂商引导区里的擦写请求
+（那道保护同样没在实机上验证过）。
+细节、已知的未知、以及开之前该做什么，见
+[`docs/hardware.md`](docs/hardware.md) 的「裸 NAND：能做什么、不能做什么」。
 
 这也是为什么社区里现有的 WS1508 直刷包普遍写着「只支持 emmc 的，nand 的刷不了」：
 它们用的是玩客云的 U-Boot，而玩客云是纯 eMMC 机器，
@@ -111,9 +163,10 @@ ssh root@<设备IP>        # 也可以试 ssh root@ws1508.local
 于是 `get_device_boot_flag()` 压根不会去探测 NAND，NAND 机器自然启动不了。
 本项目的 U-Boot 打开了这个选项，NAND 和 eMMC 两种机器都能识别、都能刷。
 
-如果你就是要 NAND 版把系统装进内置存储，目前只有一条路：
-用厂商 3.10 内核的老固件（社区有 Debian 10 的 NAND 直刷包）。
+如果你就是要 NAND 版把系统装进内置存储并从那里启动，**现成能用的**
+只有一条路：用厂商 3.10 内核的老固件（社区有 Debian 10 的 NAND 直刷包）。
 那条路和主线内核 / 新版 Debian / Docker 是互斥的，本项目不做。
+自己去实现上面那两个缺口是另一条路，但那是开发工作，不是刷个包就行。
 
 ---
 
@@ -186,8 +239,15 @@ userpatches/
   kernel/archive/meson-6.12/
     0000.patching_config.yaml 让 Armbian 自动把 dts 塞进内核并改 Makefile
     dt/meson8b-ws1508.dts     设备树（已修正内存为 512MB / 基址 0、网口为 RMII）
+    dt/meson8b-ws1508-nand.dts  裸 NAND 版设备树（实验性，默认不用）
+    ws1508-0100..0102-*.patch 给 meson_nand.c 加 meson8/meson8b 支持的内核补丁
+                              （DMA info 缓冲区定尺 / SoC 支持 / 厂商区写保护）
+    ws1508-0103-*.patch       dt-bindings: amlogic,meson-nand.yaml 加两个 compatible
+    ws1508-0104-*.patch       arch/arm/boot/dts/amlogic/meson8b.dtsi 加 NFC 节点和引脚
+  extensions/ws1508-nand.sh   打开 MTD / 裸 NAND 的内核配置
   customize-image.sh          SSH 自启 + 512MB 调优
   overlay/ws1508-install-to-emmc  在机器上把系统装进 eMMC（自己写 MBR）
+  overlay/ws1508-nand-probe   裸 NAND 只读诊断 / dump 工具
 scripts/
   common.sh                   共用配置（上游仓库均已固定 commit）
   build-uboot.sh              编译 U-Boot 并打包引导刷机包

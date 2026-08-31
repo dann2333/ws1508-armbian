@@ -61,10 +61,28 @@ detect_kernel_major_minor() {
 
 WANTED_KMM="$(detect_kernel_major_minor || true)"
 if [[ -n "${WANTED_KMM}" && ! -d "${ARMBIAN_SRC}/userpatches/kernel/archive/meson-${WANTED_KMM}" ]]; then
-	warn "Armbian's meson family now targets kernel ${WANTED_KMM}, but this repo ships the device tree under meson-6.12."
-	warn "Mirroring it to meson-${WANTED_KMM} so the WS1508 dtb is still built. Review the DTS against that kernel."
-	cp -a "${ARMBIAN_SRC}/userpatches/kernel/archive/meson-6.12" \
-	      "${ARMBIAN_SRC}/userpatches/kernel/archive/meson-${WANTED_KMM}"
+	warn "Armbian's meson family now targets kernel ${WANTED_KMM}, but this repo ships its kernel bits under meson-6.12."
+	warn "Mirroring the device tree to meson-${WANTED_KMM} so the WS1508 dtb is still built. Review the DTS against that kernel."
+	warn "The meson8b raw-NAND patches are NOT mirrored: their context is 6.12, and a failed patch aborts the whole build."
+	warn "A NAND unit built this way gets the dtb but no driver behind it. Rebase them and rename the directory."
+	# Deliberately not a blanket cp -a. The .patch files in that directory
+	# are unified diffs with 6.12 context; Armbian's patching tool treats
+	# a patch that does not apply as fatal, so carrying them onto a
+	# different kernel turns a version bump into "no image at all"
+	# instead of "one feature missing".
+	mkdir -p "${ARMBIAN_SRC}/userpatches/kernel/archive/meson-${WANTED_KMM}/dt"
+	cp -a "${ARMBIAN_SRC}/userpatches/kernel/archive/meson-6.12/0000.patching_config.yaml" \
+	      "${ARMBIAN_SRC}/userpatches/kernel/archive/meson-${WANTED_KMM}/"
+	# Only the eMMC device tree. meson8b-ws1508-nand.dts starts with a
+	# reference to &nfc, and that label exists only after ws1508-0104
+	# patches it into meson8b.dtsi - which is exactly the patch this branch
+	# refuses to carry forward. Copying it too would leave dtc resolving a
+	# label that no longer exists, and since the dt-makefile autopatcher
+	# emits a dtb- line for every .dts it finds here, that is a hard build
+	# failure at dtc - the opposite of the graceful degradation the warnings
+	# above promise.
+	cp -a "${ARMBIAN_SRC}/userpatches/kernel/archive/meson-6.12/dt/meson8b-ws1508.dts" \
+	      "${ARMBIAN_SRC}/userpatches/kernel/archive/meson-${WANTED_KMM}/dt/"
 fi
 
 # Armbian refuses to run as root unless told, and its own CI detection
@@ -163,9 +181,42 @@ if [[ "${MODE}" == "build" ]]; then
 			|| die "Image is missing /boot.scr - the bootloader would find nothing to run."
 		[[ -f "${mnt}/uInitrd" ]] \
 			|| die "Image is missing /uInitrd - boot-ws1508.cmd loads it unconditionally and would abort."
-		log "Verified: meson8b-ws1508.dtb, boot.scr and uInitrd are present in the boot partition"
+		# The NAND variant is opt-in at runtime, which means nothing at
+		# boot would complain if it silently stopped being built -- a
+		# user would just find that fdtfile=meson8b-ws1508-nand.dtb
+		# fails to load, long after the fact. Check it here instead.
+		[[ -f "${mnt}/dtb/meson8b-ws1508-nand.dtb" ]] \
+			|| die "Image is missing /dtb/meson8b-ws1508-nand.dtb - the NAND variant dts was not built."
+		log "Verified: meson8b-ws1508.dtb, meson8b-ws1508-nand.dtb, boot.scr and uInitrd are present in the boot partition"
 		umount "${mnt}"
 		losetup -d "${loop}"
 		trap - EXIT
+	fi
+
+	# A dtb that enables a controller with no driver behind it is worse
+	# than useless: nand_scan() never runs, and that same dtb has already
+	# disabled the eMMC controller. Fail the build rather than publish it.
+	if ! command -v dpkg-deb >/dev/null 2>&1; then
+		warn "dpkg-deb not available; skipping the meson_nand.ko check."
+	else
+		found_ko=""
+		shopt -s nullglob
+		for deb in "${OUTDIR}"/debs/linux-image-*.deb; do
+			# grep -c, not grep -q, and the count taken in a separate
+			# statement. Under `set -o pipefail` (common.sh) grep -q exits
+			# at the first match, dpkg-deb is killed writing to the closed
+			# pipe, and the pipeline reports failure even though the module
+			# was found - so the check would fail every kernel that has it.
+			# Same trap as the bootloader probe check in build-uboot.sh.
+			hits="$(dpkg-deb -c "${deb}" 2>/dev/null | grep -c 'meson_nand\.ko' || true)"
+			if [[ "${hits}" -gt 0 ]]; then
+				found_ko="${deb}"
+				break
+			fi
+		done
+		shopt -u nullglob
+		[[ -n "${found_ko}" ]] \
+			|| die "No linux-image .deb contains meson_nand.ko - the raw-NAND kernel patches or the ws1508-nand extension did not take effect."
+		log "Verified: meson_nand.ko is present in $(basename "${found_ko}")"
 	fi
 fi

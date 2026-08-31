@@ -1,0 +1,209 @@
+#!/bin/bash
+#
+# Read-only diagnostics for the WS1508's raw NAND.
+#
+# Only useful on a unit booted with fdtfile=meson8b-ws1508-nand.dtb. It
+# reports what the driver made of the flash and, on request, dumps a
+# window of it to a file so the result can be compared offline against a
+# dump taken with the vendor u-boot's "amlnf" commands.
+#
+# There is deliberately no write, erase or format path in this script. Be
+# aware that the image DOES ship mtd-utils, so flash_erase, nandwrite,
+# nandtest and ubiformat are all present and all work straight through
+# /dev/mtdN -- the things stopping them are in the driver, not here:
+# the MTD is read-only unless you boot with meson_nand.allow_write=1, and
+# erase, program, OOB write and mark-bad are refused below the vendor boot
+# region whatever you pass.
+#
+# The meson8b NAND support has never run on real S805 silicon. Everything
+# here exists to find out whether it works at all, not to put data on the
+# chip.
+#
+# Reminder: none of this makes the box boot from NAND, and this project
+# has not implemented anything that would. The bootloader can read raw
+# NAND -- "store read <name> <addr> <off> <size>" dispatches to the amlnf
+# driver, which is how the vendor 3.10 firmware boots -- but it has no
+# filesystem layer over the flash (CONFIG_NEXT_NAND drops libmtd.o and
+# libnand.o), our boot script only ever fatloads from usb/sd/mmc, and
+# Linux still has no way to root a filesystem on the vendor NFTL.
+
+set -euo pipefail
+
+MTD=/dev/mtd0
+SYS=/sys/class/mtd/mtd0
+
+die()  { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+
+[ "$(id -u)" -eq 0 ] || die "Run this as root."
+
+# ---------------------------------------------------------------------------
+# Is the controller even there?
+# ---------------------------------------------------------------------------
+info "Device tree"
+model="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || echo unknown)"
+echo "  model:  ${model}"
+case "${model}" in
+	*"raw NAND"*) ;;
+	*)
+		echo
+		echo "  This kernel is running the eMMC device tree, so the NAND"
+		echo "  controller is disabled and there is nothing to probe."
+		echo "  To enable it, add this line to /boot/armbianEnv.txt:"
+		echo
+		echo "      fdtfile=meson8b-ws1508-nand.dtb"
+		echo
+		echo "  Read the notes next to it in that file first."
+		exit 0
+		;;
+esac
+
+info "Platform device"
+# The controller node is at physical 0xd0048600; the platform device is
+# named after it, so its presence means the DT node was parsed and the
+# driver's of_match ran.
+ls -d /sys/bus/platform/devices/*48600* 2>/dev/null \
+	|| echo "  (no d0048600 platform device - the dtb does not describe it)"
+
+info "Driver binding"
+if [ -e /sys/bus/platform/drivers/meson-nand ]; then
+	ls -l /sys/bus/platform/drivers/meson-nand/ 2>/dev/null \
+		| awk '/48600/ {print "  bound: " $NF}' \
+		|| echo "  meson-nand is loaded but nothing is bound to it"
+else
+	echo "  meson-nand driver not loaded; try 'modprobe meson_nand'"
+fi
+
+# ---------------------------------------------------------------------------
+# What the driver decided
+# ---------------------------------------------------------------------------
+info "Driver's attach-time report"
+# One line printed by meson_nand_attach_chip(). This is the single most
+# useful thing on the machine: page/oob/erase sizes identify the fitted
+# die, and the ecc/bch/clk fields say whether the ECC choice and the clock
+# tree came out the way they were meant to.
+dmesg | grep -E "meson-nand|48600\.nand-controller" || echo "  (nothing in dmesg)"
+
+info "NAND clock"
+for c in nand_clk_gate nand_clk_div nand_clk_sel; do
+	f="/sys/kernel/debug/clk/${c}/clk_rate"
+	if [ -r "${f}" ]; then
+		printf '  %-14s %s Hz\n' "${c}" "$(cat "${f}")"
+	fi
+done
+[ -r /sys/kernel/debug/clk/nand_clk_gate/clk_rate ] || \
+	echo "  (mount debugfs to see these: mount -t debugfs none /sys/kernel/debug)"
+echo "  For reference: the vendor bootloader runs this at ~212.6 MHz and"
+echo "  the boot ROM leaves it at ~159.4 MHz. Anything in the 60-260 MHz"
+echo "  band off a parent the clock driver knows means the path works."
+
+info "Interrupt"
+# Expected to find nothing. meson8b.dtsi gives the NFC node no "interrupts"
+# property at all -- no Amlogic code has ever enabled this controller's
+# ready/busy interrupt on this SoC family, so there is no number to put
+# there that anyone has confirmed -- and the driver waits for ready in
+# software and does not request a line. Finding the number is an open
+# question: add an interrupts property to a local copy of the dtb and boot
+# with meson_nand.use_irq_rb=1, and a non-zero count here is the evidence.
+grep -E "48600|meson-nand" /proc/interrupts || echo "  (no NFC interrupt registered - expected: the dtb declares none)"
+
+info "MTD"
+if [ ! -e "${SYS}" ]; then
+	echo "  No mtd0. The controller did not finish nand_scan() - see dmesg above."
+	exit 1
+fi
+cat /proc/mtd
+for f in type name size erasesize writesize oobsize; do
+	[ -r "${SYS}/${f}" ] && printf '  %-11s %s\n' "${f}" "$(cat "${SYS}/${f}")"
+done
+if grep -qw "${SYS##*/}" /proc/mtd && [ -r "${SYS}/flags" ]; then
+	printf '  %-11s %s\n' flags "$(cat "${SYS}/flags")"
+fi
+
+# 0x400 = MTD_WRITEABLE. Absent means the driver's read-only default is in
+# force, which is what a machine that has not been validated should show.
+if [ -r "${SYS}/flags" ] && [ $(( $(cat "${SYS}/flags") & 0x400 )) -eq 0 ]; then
+	echo "  -> read-only (the driver's default). Good."
+else
+	echo "  -> WRITABLE. meson_nand.allow_write=1 is in effect. Erase,"
+	echo "     program, OOB write and mark-bad are still refused below the"
+	echo "     vendor boot region, but nothing above it is protected."
+	echo "     In particular, do NOT run 'nandtest' on this device: it"
+	echo "     erases every block it touches."
+fi
+
+# ---------------------------------------------------------------------------
+# Optional dump
+# ---------------------------------------------------------------------------
+# mtd-utils is in REQUIRED_PACKAGES, so this should not fire on a stock
+# image; keep the branch for images built without it.
+command -v nanddump >/dev/null 2>&1 || {
+	echo
+	echo "nanddump not found. Install mtd-utils for the dump step"
+	echo "(apt-get install mtd-utils)."
+	exit 0
+}
+
+cat <<EOF
+
+  Optional: dump the start of the flash to a file for offline comparison
+  against a dump taken with the vendor u-boot. This only reads.
+
+  This is a diagnostic sample, NOT a backup you can restore. See the note
+  printed after the dump.
+
+EOF
+erasesize="$(cat "${SYS}/erasesize")"
+
+# Cover at least the region the driver write-protects, which is clamped to
+# a 16MiB floor (MESON8_VENDOR_MIN_BYTES in ws1508-0102-*.patch). Dumping
+# less than that would stop short of the tail of the vendor reserved area,
+# where nkey/nsec live. 100 blocks is the historical minimum and is kept as
+# a floor for very large erase blocks.
+guard=$((16 * 1024 * 1024))
+blocks=$(( (guard + erasesize - 1) / erasesize ))
+if [ "${blocks}" -lt 100 ]; then
+	blocks=100
+fi
+length=$((erasesize * blocks))
+
+printf '  Dump the first %s blocks (%s bytes, covering the write-protected\n' "${blocks}" "${length}"
+printf '  vendor region)? [y/N] '
+read -r answer
+case "${answer}" in
+	[yY]*) ;;
+	*) echo "  Skipped."; exit 0 ;;
+esac
+
+read -r -p "  Write it where? [/root/ws1508-nand-head.bin] " outfile
+outfile="${outfile:-/root/ws1508-nand-head.bin}"
+
+# --bb=dumpbad rather than skipbad: a factory bad block is itself part of
+# what we want to see, and skipping shifts every later offset.
+info "Dumping ${length} bytes (${blocks} x ${erasesize}) to ${outfile}"
+nanddump --bb=dumpbad --length="${length}" --file="${outfile}" "${MTD}"
+
+sync
+ls -la "${outfile}"
+cat <<EOF
+
+  Now copy it OFF the device (scp, or onto the USB rootfs you booted
+  from) before doing anything else.
+
+  What this dump is and is not. It is a diagnostic sample: compare it
+  against a dump taken with the vendor u-boot ("amlnf read" / "store
+  read") to find out whether this driver reads the flash correctly.
+  Uncorrectable ECC on hardware-ECC reads of vendor-written pages is the
+  EXPECTED result until the ECC strength and scrambler settings are known
+  to agree -- it is not by itself a driver bug, and pages 0/256/512/768
+  are written by the ROM in a mode this dtb does not enable, so those
+  four will not match at all.
+
+  It is NOT a restorable backup of nkey/nsec. It carries no OOB, the ECC
+  settings that produced it are unvalidated, and neither this kernel nor
+  anything in this image can write the vendor region back -- the driver
+  refuses that categorically. If you want a real backup of the vendor
+  reserved area, take it with the vendor bootloader's amlnf/store
+  commands.
+
+EOF

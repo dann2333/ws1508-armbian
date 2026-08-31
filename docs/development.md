@@ -18,7 +18,7 @@ S805 片内 ROM
                            └─ fatload ${bootdev} boot.scr && autoscr
                                 └─ Armbian boot.scr（由 boot-ws1508.cmd 编译而来）
                                      ├─ 读 armbianEnv.txt 拿 rootdev
-                                     ├─ fatload uImage / uInitrd / dtb/meson8b-ws1508.dtb
+                                     ├─ fatload uImage / uInitrd / dtb/${fdtfile}
                                      └─ bootm
                                           └─ u-boot 用实测 DDR 容量重写 /memory 节点
                                                └─ Linux 6.12
@@ -247,9 +247,18 @@ DRAM 基址是 `0x00000000`，不是设备树里写的 `0x40000000`：
 | 脚本 | 检查 |
 |---|---|
 | `build-uboot.sh` | 编出来的 U-Boot 里同时有 `try nand boot` 和 `try emmc boot`；NAND 探测顺序补丁在位 |
-| `build-armbian.sh` | 镜像 boot 分区里有 `dtb/meson8b-ws1508.dtb`、`boot.scr` 和 `uInitrd`（启动脚本无条件加载 uInitrd，缺了就起不来） |
+| `build-armbian.sh` | 镜像 boot 分区里有 `dtb/meson8b-ws1508.dtb`、`boot.scr` 和 `uInitrd`（启动脚本无条件加载 uInitrd，缺了就起不来）；另外有 `dtb/meson8b-ws1508-nand.dtb`，且至少一个 `linux-image-*.deb` 里带 `meson_nand.ko` |
 | `make-burn-image.sh` | 打好的 burn 包能被 AmlImg 原样解回来，且 5 个必需成员齐全 |
 
+后两项是 NAND 变体加的。它是**运行期 opt-in** 的：设备树或驱动悄无声息地
+没编进去，启动时不会有任何东西抱怨，用户只会在很久以后发现
+`fdtfile=meson8b-ws1508-nand.dtb` 加载失败。所以只能在构建期查。
+
+> 已知的一个不一致：内核版本被上游改掉时，脚本会把 `dt/` 镜像到新目录、
+> 但**不镜像那 5 个 `.patch`**（6.12 的上下文套到别的内核上会让整个构建挂掉），
+> 并打印「dtb 有、驱动没有」的警告。而 `meson_nand.ko` 那道检查在同一种情况下
+> 会直接 `die`。两者的意图对不上：警告说会降级，检查说不许降级。
+> 目前的净效果是构建失败（fail safe），但报错信息指向的是扩展，不是版本变更。
 ---
 
 ## 踩过的坑
@@ -324,6 +333,45 @@ eMMC 版刷完 `.burn.img`、拔掉 U 盘、通电，等 2 分钟：
   如果实机 eMMC 不稳定，先把这两项降下来试；
 - 完整 `.burn.img` 在 NAND 版机器上的行为（预期：引导能写，
   boot/rootfs 白写，最后还是从 U 盘启动）。
+
+### meson8b 裸 NAND 驱动：树里目前最大的一块没验证过的东西
+
+单独列一节，因为它比上面几条加起来都大。涉及的文件：
+
+```
+userpatches/kernel/archive/meson-6.12/ws1508-0100..0104-*.patch
+userpatches/kernel/archive/meson-6.12/dt/meson8b-ws1508-nand.dts
+userpatches/extensions/ws1508-nand.sh
+userpatches/overlay/ws1508-nand-probe
+```
+
+具体不知道的是：
+
+- **主线 `meson_nand.c` 从来没有在 meson8b 芯片上跑过。** 2019 年唯一一次尝试
+  是在 Meson8m2 上，而且没进主线。所以「`nand_scan()` 到底能不能枚举出
+  这颗芯片」本身就是未知数 —— 枚举不出来、压根没有 `/dev/mtd0`，
+  是预期结果之一，不是回归。
+- **中断号 `GIC_SPI 34` 没有实测过**，是从 Amlogic 的头文件里推出来的。
+  驱动默认不用中断（软件轮询等 ready），就是为了把它挪出关键路径。
+  如果这个号其实属于别的外设，加 `meson_nand.use_irq_rb=1` 会让处理函数
+  无条件 `IRQ_HANDLED` 掉别人的中断。
+- **ECC 强度和加扰器设置有没有和厂商写进去的一致，未知。**
+  设备树里 ECC 是故意没写死的。在对上之前，用硬件 ECC 读厂商写过的页
+  返回不可纠正错误，是**预期结果**，不是「闪存坏了」也不一定是「驱动坏了」。
+- **`ws1508-0100` 处理的那个 info DMA 越界至今没有官方解释。**
+  这里要标明来源：「2019 年在 Meson8m2 上移植时报给 Amlogic、其 NFC 作者
+  转给了内部 VLSI 团队、一直没有回音，256 字节够用、512 字节看不到更多」
+  这一串说法是**转述的二手信息**，本项目没有复现过，也没有找到可引用的
+  邮件列表存档链接。补丁的做法（给它一整页）是对着一个没有文档的硬件行为
+  下的保守猜测，不是测出来的边界。
+- 厂商引导区写保护的边界（前 1024 页 + 64 个块）是按芯片**自报**的
+  页/块大小算出来的。几何认错，边界跟着错，而真实的厂商区不会跟着动。
+- 从内置 NAND 启动这条路，本项目**没有实现也没有试过**：引导程序有
+  `store read` 能按裸偏移读 NAND，但本仓库的 `boot-ws1508.cmd` 没有走它的分支，
+  Linux 这边也没有能挂在厂商 NFTL 上的根文件系统。它是「没做」，不是「做不到」。
+
+这就是为什么这部分**默认关闭、默认只读**，而且需要用户在
+`armbianEnv.txt` 里手动加一行才生效。
 
 **这些都不需要串口就能反馈。** U-Boot 的存储探测结果会通过内核命令行
 `ws1508.store=`（1=NAND / 2=eMMC / 3=没探测到）传进系统，

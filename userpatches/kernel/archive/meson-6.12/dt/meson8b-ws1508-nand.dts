@@ -1,0 +1,153 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * Xunlei WS1508, raw-NAND variant.
+ *
+ * Same board as meson8b-ws1508.dts, with the internal flash driven as raw
+ * NAND instead of eMMC. Boot it by putting
+ *
+ *     fdtfile=meson8b-ws1508-nand.dtb
+ *
+ * in /boot/armbianEnv.txt on a unit whose bootloader reports ws1508.store=1.
+ * On an eMMC unit this dtb disables the controller the root filesystem is
+ * on, so run "ws1508-info" and confirm it says "raw NAND" first.
+ *
+ * READ THIS BEFORE USING IT:
+ *
+ *   - EXPERIMENTAL, AND UNTESTED ON HARDWARE. The meson8/meson8b support
+ *     in drivers/mtd/nand/raw/meson_nand.c that this dtb switches on has
+ *     never been run on real S805 silicon by anybody. It may not
+ *     enumerate the chip at all (no /dev/mtd0), and if it does the reads
+ *     may come back uncorrectable or silently wrong until the ECC
+ *     strength and the scrambler settings are confirmed against a dump
+ *     taken with the vendor bootloader.
+ *
+ *   - It does NOT make the box boot from internal storage, and this
+ *     project has not implemented anything that would. Two separate
+ *     things are true and they are often conflated:
+ *
+ *       * The bootloader CAN read raw NAND. Our u-boot config defines
+ *         CONFIG_NEXT_NAND, which drops libmtd.o and libnand.o from the
+ *         build, so there is no MTD layer and no filesystem layer over
+ *         the flash -- "fatload" from NAND is impossible. But
+ *         common/store_interface.c is linked unconditionally and gives
+ *         "store read <name> <addr> <off> <size>", which dispatches to
+ *         the amlnf driver's "amlnf read_byte" on a NAND unit. That is
+ *         how the vendor 3.10 firmware boots from internal flash.
+ *
+ *       * This project's boot script only ever fatloads from usb/sd/mmc,
+ *         so nothing here uses that path, and Linux still has no way to
+ *         root a filesystem on the vendor NFTL. uImage, uInitrd and this
+ *         dtb come off USB or SD.
+ *
+ *     So internal boot is unimplemented here, not impossible in
+ *     principle. If you want to work on it, "store read" is the hook.
+ *
+ *   - What this dtb gives you, IF the driver enumerates the chip, is
+ *     /dev/mtd0: read-only by default, enough to dump the flash and
+ *     compare it against a vendor dump. Making it writable needs
+ *     meson_nand.allow_write=1 on the kernel command line, and even then
+ *     the driver refuses every erase, program, OOB write and mark-bad
+ *     below its vendor-region boundary.
+ *
+ *   - Before the first boot with this dtb, have a working USB Burning
+ *     Tool setup. Note that the burning tool restores firmware but not
+ *     the per-device nkey/nsec blobs in the vendor reserved area, and
+ *     that a nanddump taken through this driver is a diagnostic sample,
+ *     not a restorable backup of them.
+ *
+ *   - If you want the belt-and-braces slab checking that would catch a
+ *     DMA overrun in this driver, build the kernel with
+ *     WS1508_NAND_SLUB_DEBUG=yes (see userpatches/extensions/ws1508-nand.sh).
+ *     Released images do not have it, so on a released image an
+ *     unexplained kernel oops after enabling this dtb should be assumed
+ *     to be NAND-related and reported as such.
+ */
+
+/dts-v1/;
+#include "meson8b-ws1508.dts"
+
+/ {
+	model = "Xunlei WS1508 (raw NAND variant)";
+};
+
+/*
+ * BOOT_0..BOOT_10 carry the NAND bus and the sdxc_c bus on the same pads
+ * (drivers/pinctrl/meson/pinctrl-meson8b.c), so exactly one of these two
+ * controllers can be enabled in any one dtb. This disables &sdhc, the
+ * internal eMMC controller, and only that: the SD card slot is on &sdio
+ * with its own pins and keeps working.
+ */
+&sdhc {
+	status = "disabled";
+};
+
+&nfc {
+	status = "okay";
+
+	pinctrl-0 = <&nand_pins>;
+	pinctrl-names = "default";
+
+	nand@0 {
+		reg = <0>;
+		nand-rb = <0>;
+		nand-ecc-mode = "hw";
+
+		/*
+		 * ECC is deliberately not pinned. The fitted part is a Xunlei
+		 * house-marked die (e.g. WS1508CRA10L) whose page and OOB
+		 * sizes are not published, and the vendor's own rule for
+		 * picking a strength -- oobsize / steps >= ecc_bytes + 2 --
+		 * cannot be evaluated without them. Read the geometry off a
+		 * real unit from the "page ... oob ... erase ..." line the
+		 * driver prints at attach time, then add
+		 * nand-ecc-step-size = <1024> and the matching strength here.
+		 */
+
+		/*
+		 * EXPECTED, NOT A BUG: pages 0, 256, 512 and 768 will read as
+		 * uncorrectable ECC with this configuration.
+		 *
+		 * The boot ROM reads the first page of each of the four
+		 * BOOT_PAGES_PER_COPY groups in short mode: 384-byte sectors
+		 * with BCH60, not the chip's normal geometry
+		 * (drivers/amlnf/phy/boot_operation.c). meson_nand.c can emit
+		 * exactly that -- meson8_data sets .boot_page_bch =
+		 * NFC_ECC_BCH60_1K -- but only for a chip whose node carries
+		 * nand-is-boot-medium plus amlogic,boot-pages and
+		 * amlogic,boot-page-step, and those three are deliberately
+		 * absent here.
+		 *
+		 * Why they are absent, so that nobody adds them casually:
+		 *
+		 *   - meson_nfc_ecc_correct() and meson_nfc_get_user_byte()
+		 *     walk nand->ecc.steps entries of the info buffer, but a
+		 *     short-mode transfer produces writesize/512 of them
+		 *     describing 384-byte sectors. Turning the mode on would
+		 *     under-check ECC on exactly the pages that matter and
+		 *     hand back OOB bytes read from the wrong words -- worse
+		 *     than a visible uncorrectable error.
+		 *
+		 *   - It is a write path into the region the boot ROM reads.
+		 *     The driver's address guard covers that region, so it is
+		 *     not a brick risk today, but it is not a knob to turn on
+		 *     casually either.
+		 *
+		 * If you are comparing a dump against one taken with the
+		 * vendor bootloader, expect those four pages to differ and
+		 * compare the rest.
+		 *
+		 * Two more properties are absent on purpose:
+		 *
+		 *   nand-on-flash-bbt
+		 *     the driver forces NAND_BBT_NO_OOB with it, which writes
+		 *     Linux's own bad-block table into blocks at the end of
+		 *     the chip -- inside the area the vendor NFTL owns.
+		 *
+		 *   partitions
+		 *     offsets cannot be computed without the geometry, and
+		 *     with none declared /dev/mtd0 is the whole chip. Until
+		 *     then the driver's own address guard is what keeps the
+		 *     vendor region intact.
+		 */
+	};
+};

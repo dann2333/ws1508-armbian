@@ -24,10 +24,26 @@
  *      size is what reaches Linux, via fdt_fixup_memory_banks().
  *
  *   3. The boot command tries USB, then SD, then eMMC, instead of eMMC
- *      only. A NAND unit has no usable rootfs medium internally (mainline
- *      Linux has no meson8b raw-NAND driver), so it must fall through to
- *      USB/SD; and USB-first gives every unit a rescue path that does not
- *      need the case opened.
+ *      only. A NAND unit has no bootable rootfs medium internally, so it
+ *      must fall through to USB/SD; and USB-first gives every unit a
+ *      rescue path that does not need the case opened.
+ *
+ *      Two things that used to be said here and are wrong:
+ *      (a) "mainline Linux has no meson8b raw-NAND driver". It does now,
+ *          carried by this repo: userpatches/kernel/archive/meson-6.12/
+ *          ws1508-0100..0104-*.patch add meson8/meson8b to
+ *          drivers/mtd/nand/raw/meson_nand.c. It is opt-in (a separate
+ *          dtb), read-only by default, and has NEVER been run on real
+ *          meson8b silicon -- so it does not make NAND a rootfs medium,
+ *          but the reason is no longer "no driver exists".
+ *      (b) "the bootloader cannot read NAND". It can: CONFIG_NEXT_NAND
+ *          drops libmtd.o/libnand.o (no filesystem layer, so no fatload
+ *          from NAND) but links common/store_interface.o, whose
+ *          "store read <name> <addr> <off> <size>" forwards to
+ *          "amlnf read_byte" on a NAND unit. Vendor firmware boots that
+ *          way. What is missing is a boot script on this side that uses
+ *          it, plus a rootfs story on the vendor NFTL. Both are
+ *          unimplemented here, not impossible.
  *
  *   4. Ethernet is RMII (100Mbit) rather than RGMII. See eth.c.
  */

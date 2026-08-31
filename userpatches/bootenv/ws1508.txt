@@ -30,4 +30,61 @@ console="both"
 #   unrelated mechanism that this image does not use.
 # extraargs=""
 
+# fdtfile:
+#   Which device tree the boot script loads from /dtb/.
+#   Default (and correct for almost everyone): meson8b-ws1508.dtb.
+#   That file is right on BOTH variants -- on a raw-NAND unit the eMMC
+#   controller it enables simply finds no card, which costs nothing.
+#
+#   The one alternative is the raw-NAND variant:
+#
+#     fdtfile=meson8b-ws1508-nand.dtb
+#
+#   It is EXPERIMENTAL and only makes sense on a unit where
+#   'ws1508-info' reports "store: raw NAND". Check that FIRST: on an
+#   eMMC unit this dtb disables the controller the rootfs lives on and
+#   the box will hang in rootwait. What it does:
+#     - disables the eMMC controller (&sdhc). Those are the same BOOT_x
+#       pads as the NAND bus, so the two can never both be enabled. On a
+#       NAND unit there is nothing on them to lose. The SD card slot is
+#       a different controller (&sdio) and is NOT affected.
+#     - enables the S805 raw-NAND controller. IF the driver enumerates
+#       the fitted die you get /dev/mtd0. That "if" is real: this driver
+#       has never run on meson8b silicon, so nand_scan() failing
+#       outright, or reads of vendor-written pages coming back
+#       ECC-uncorrectable, are both expected possibilities rather than
+#       bugs to report as regressions.
+#   What it does NOT do:
+#     - it does not let the box boot from internal storage. Not because
+#       the bootloader cannot read NAND -- it can, with
+#       "store read"/"amlnf read", which is how vendor firmware boots --
+#       but because it has no filesystem layer over NAND (fatload cannot
+#       work there) and nothing in THIS project implements a store-read
+#       boot path or a rootfs on the vendor NFTL. The kernel, initrd and
+#       dtb come off USB or SD.
+#     - it does not give you writable internal storage. The MTD is
+#       read-only unless you also add meson_nand.allow_write=1 to
+#       extraargs, and even then the driver rejects erase/program
+#       requests that land in the vendor bootloader region. That guard
+#       is untested on hardware like everything else here, and the image
+#       does ship mtd-utils (nanddump's package also carries
+#       flash_erase, nandwrite, nandtest and ubiformat), so it is the
+#       only thing standing between those tools and the boot region.
+#       Point nothing but nanddump at /dev/mtd0.
+#
+#   Before you try it: have a working Amlogic USB Burning Tool setup.
+#   That is the only unbrick path, and it restores firmware but NOT the
+#   per-device nkey/nsec blobs in the vendor reserved area -- those are
+#   gone for good if they are overwritten, and nothing this project
+#   ships can write them back. The dump 'ws1508-nand-probe' offers is a
+#   diagnostic sample for comparing against a vendor-u-boot read, not a
+#   restorable backup: the ECC/scrambler settings are unvalidated so the
+#   contents may be wrong, it captures no OOB, and the driver refuses
+#   that region categorically. A real nkey/nsec backup, if one is
+#   possible at all, has to be taken with the vendor u-boot's
+#   amlnf/store commands over the serial console.
+#
+#   If it does not boot, put the USB stick back in and delete this line.
+# fdtfile=meson8b-ws1508-nand.dtb
+
 # The following contents are auto-generated.

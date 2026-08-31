@@ -1,0 +1,145 @@
+Subject: dt-bindings: mtd: amlogic,meson-nand: add Meson8 and Meson8b
+
+Meson8/8b have a NAND clock tree of their own in the clock controller,
+so unlike GXL and AXG there is no borrowed SD_EMMC_C register to map and
+"reg" carries just the one "nfc" entry. They also do not require the
+interrupt: the driver waits for ready in software there, because no
+Amlogic code has ever enabled the NFC ready/busy interrupt on this
+family and no device tree carries a number for it.
+
+The ECC strength list for the new compatibles deliberately does not
+repeat the GXL line verbatim. 16 is not implementable: meson_ecc[] and
+the NFC_ECC_* enum have no BCH16 entry and meson_gxl_ecc_caps does not
+offer one, so nand-ecc-strength = <16> fails nand_ecc_choose_conf() with
+-ENOTSUPP. On M8 silicon it is worse than unsupported -- Amlogic's
+hw_ctrl.h gives NAND_ECC_BCH16_1K and NAND_ECC_BCH24_1K the same
+register value under CONFIG_NAND_AML_M8 -- so it is left out rather than
+copied.
+
+Validated with dtschema 2026.6:
+
+  $ make ARCH=arm CROSS_COMPILE=arm-linux-gnueabihf- \
+      dt_binding_check \
+      DT_SCHEMA_FILES=.../mtd/amlogic,meson-nand.yaml
+    SCHEMA  Documentation/devicetree/bindings/processed-schema.json
+    DTEX    .../mtd/amlogic,meson-nand.example.dts
+    DTC [C] .../mtd/amlogic,meson-nand.example.dtb
+  $ echo $?
+  0
+
+The second example uses numeric clock indices rather than including
+dt-bindings/clock/meson8b-clkc.h, because dt-extract-example
+concatenates all examples into one .dts and that header's CLKID_*
+macros collide with the axg ones the first example includes.
+
+diff --git a/Documentation/devicetree/bindings/mtd/amlogic,meson-nand.yaml b/Documentation/devicetree/bindings/mtd/amlogic,meson-nand.yaml
+index 284f0f8..47b9e8c 100644
+--- a/Documentation/devicetree/bindings/mtd/amlogic,meson-nand.yaml
++++ b/Documentation/devicetree/bindings/mtd/amlogic,meson-nand.yaml
+@@ -4,10 +4,7 @@
+ $id: http://devicetree.org/schemas/mtd/amlogic,meson-nand.yaml#
+ $schema: http://devicetree.org/meta-schemas/core.yaml#
+ 
+-title: Amlogic NAND Flash Controller (NFC) for GXBB/GXL/AXG family SoCs
+-
+-allOf:
+-  - $ref: nand-controller.yaml
++title: Amlogic NAND Flash Controller (NFC) for Meson8/GXBB/GXL/AXG family SoCs
+ 
+ maintainers:
+   - liang.yang@amlogic.com
+@@ -15,13 +12,17 @@ maintainers:
+ properties:
+   compatible:
+     enum:
++      - amlogic,meson8-nfc
++      - amlogic,meson8b-nfc
+       - amlogic,meson-gxl-nfc
+       - amlogic,meson-axg-nfc
+ 
+   reg:
++    minItems: 1
+     maxItems: 2
+ 
+   reg-names:
++    minItems: 1
+     items:
+       - const: nfc
+       - const: emmc
+@@ -56,6 +57,7 @@ patternProperties:
+         enum: [8, 16, 24, 30, 40, 50, 60]
+         description: |
+           The ECC configurations that can be supported are as follows.
++            meson8-nfc, meson8b-nfc 8, 24, 30, 40, 50, 60
+             meson-gxl-nfc 8, 16, 24, 30, 40, 50, 60
+             meson-axg-nfc 8
+ 
+@@ -92,10 +94,39 @@ patternProperties:
+ required:
+   - compatible
+   - reg
+-  - interrupts
+   - clocks
+   - clock-names
+ 
++allOf:
++  - $ref: nand-controller.yaml
++
++  # Meson8/8b have a NAND clock tree of their own in the clock controller, so
++  # unlike GXL/AXG there is no borrowed SD_EMMC_C register to map. They also
++  # do not need the interrupt: no Amlogic code has ever enabled the NFC
++  # ready/busy interrupt on that family, so the driver waits in software.
++  - if:
++      properties:
++        compatible:
++          contains:
++            enum:
++              - amlogic,meson8-nfc
++              - amlogic,meson8b-nfc
++    then:
++      properties:
++        reg:
++          maxItems: 1
++        reg-names:
++          items:
++            - const: nfc
++    else:
++      properties:
++        reg:
++          minItems: 2
++        reg-names:
++          minItems: 2
++      required:
++        - interrupts
++
+ unevaluatedProperties: false
+ 
+ examples:
+@@ -122,4 +153,27 @@ examples:
+       };
+     };
+ 
++  - |
++    // Deliberately not using dt-bindings/clock/meson8b-clkc.h here: the
++    // examples are concatenated into one .dts, and its CLKID_* macros collide
++    // with the axg ones included above.
++    nand-controller@48600 {
++      compatible = "amlogic,meson8b-nfc";
++      reg = <0x48600 0x100>;
++      reg-names = "nfc";
++      clocks = <&clkc 53>, <&clkc 112>; /* CLKID_NAND, CLKID_NAND_CLK */
++      clock-names = "core", "device";
++
++      pinctrl-0 = <&nand_pins>;
++      pinctrl-names = "default";
++
++      #address-cells = <1>;
++      #size-cells = <0>;
++
++      nand@0 {
++        reg = <0>;
++        nand-rb = <0>;
++      };
++    };
++
+ ...

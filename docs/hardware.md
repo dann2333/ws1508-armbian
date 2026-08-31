@@ -83,8 +83,10 @@ dmesg | grep -i mmc
 - 一个 `mmcblk*` 都没有 → **NAND 版**（这机器没有 TF 卡槽，所以正常情况下
   `mmcblk0` 本来就不存在，能出现的只有 eMMC 的 `mmcblk1`）
 
-> 注意：主线内核没有 meson8b 的 NAND 驱动，所以 NAND 版机器上
-> **不会**出现 `/dev/mtd*`，看不到不等于没有闪存。
+> 注意：默认设备树里 NAND 控制器是关掉的，所以 NAND 版机器上默认
+> **不会**出现 `/dev/mtd*`，看不到不等于没有闪存。本项目现在带了一个
+> 实验性的 meson8b 裸 NAND 驱动，需要手动切设备树才生效，
+> 见下面「裸 NAND：能做什么、不能做什么」。
 
 ### 方法二：拆机看闪存芯片
 
@@ -118,6 +120,186 @@ cat /proc/cmdline | tr ' ' '\n' | grep ws1508.store
 
 ---
 
+## 裸 NAND：能做什么、不能做什么
+
+主线的 `drivers/mtd/nand/raw/meson_nand.c` 原本只认 `amlogic,meson-gxl-nfc`
+和 `amlogic,meson-axg-nfc`。本项目在
+`userpatches/kernel/archive/meson-6.12/` 下带了 **5 个**补丁
+（`ws1508-0100` 到 `ws1508-0104`），把 meson8/meson8b 加了进去：
+寄存器映射和命令编码和 GXL 完全一样，差别在时钟树、启动页的 BCH 码、
+加扰器和一个会越界的 DMA。
+
+| 补丁 | 动的文件 |
+|---|---|
+| `0100` | `meson_nand.c`：给 DMA info 缓冲区定尺，并给 ECC 完成轮询加超时 |
+| `0101` | `meson_nand.c`：加 meson8/meson8b 两个 compatible 和它们的差异项 |
+| `0102` | `meson_nand.c`：厂商引导区写保护（单独一个补丁，免得被顺手丢掉） |
+| `0103` | `Documentation/devicetree/bindings/mtd/amlogic,meson-nand.yaml` |
+| `0104` | `arch/arm/boot/dts/amlogic/meson8b.dtsi`：NFC 节点和 nand 引脚组 |
+
+审查或 rebase 的时候请数够 5 个 —— 尤其是 `0102`，
+它是 `meson_nand.allow_write=1` 和厂商引导区之间唯一的东西。
+
+### 先说清楚：这**不会**让机器从内置存储启动
+
+不会，但理由不是「引导程序读不到 NAND」——那句话本仓库早先版本写过，是错的。
+准确的分界线是：
+
+- 引导程序**没有文件系统层**。`CONFIG_NEXT_NAND`
+  （`uboot/configs/m8b_ws1508.h:137`）让 Amlogic 的 `Makefile` 把
+  `drivers/mtd/libmtd.o` 和 `drivers/mtd/nand/libnand.o` 从构建里踢掉
+  （`Makefile:216-226`），所以 `fatload` 不可能从 NAND 上的某个文件系统里
+  读出 uImage。
+- 但引导程序**能按裸偏移读 NAND**。同一个宏把 `common/store_interface.o`
+  编了进去（`common/Makefile:173-176`）：`store read <名字> <地址> <偏移> <长度>`
+  在探测到 NAND 时转成 `amlnf read_byte`（`common/store_interface.c:293-311`），
+  用法说明就写着「read 'size' bytes … skipping bad blocks」（`:938`）。
+  厂商 3.10 固件就是靠这条路从内置 NAND 启动的。
+- 差的是**本项目没实现这条路**。`userpatches/bootscripts/boot-ws1508.cmd`
+  只会 `fatload ${bootdev} …`，没有 `store read` 分支；而且就算引导起来了，
+  内置闪存上是厂商的 NFTL 布局，主线 Linux 没有能挂上去的根文件系统方案。
+
+所以：**从内置 NAND 启动在本项目里是「没做」，不是「做不到」。**
+谁想做，缺口就是上面两条——一个 `store read` 版的启动脚本（外加一份对得上的
+偏移表），和一个不动厂商保留区的根文件系统方案。在此之前，
+内核、initrd、dtb 一律来自 U 盘或 SD 卡。
+
+内核这边**期望**给出的是一个 `/dev/mtd0`：把闪存**读**出来，仅此而已。
+写「期望」是因为这个驱动从来没在 meson8b 芯片上跑过 —— 见下面
+「已知没验证过的地方」。
+
+### 怎么开
+
+**先确认你这台是 NAND 版。** 跑 `ws1508-info`，只有它报
+`store: raw NAND` 才往下走。
+
+> ⚠️ 在 **eMMC 版**机器上加这一行会把机器搞成起不来：这个设备树把
+> `&sdhc` 关了，`mmcblk1` 会整个消失，而 eMMC 上装了系统的机器
+> 根文件系统就在那上面 —— 内核会一直卡在 `rootwait`。
+> 更麻烦的是那行 `fdtfile=` 写在 eMMC 的 boot 分区里，
+> 系统起不来就改不了。
+> 救法：做一张启动 U 盘插上（U-Boot 是 USB 优先），从 U 盘进系统，
+> 挂上 `/dev/mmcblk1p1` 把那一行删掉。SD 卡槽走的是另一个控制器
+> （`&sdio`），这个设备树不动它，所以 SD 卡也能救。
+
+确认是 NAND 版之后，在 `/boot/armbianEnv.txt` 里加一行，然后重启：
+
+```
+fdtfile=meson8b-ws1508-nand.dtb
+```
+
+这个设备树会**关掉 eMMC 控制器 `&sdhc`**（BOOT_0..BOOT_10 这组焊盘是
+NAND 总线和 sdxc_c 总线共用的，两个控制器不可能同时开），并打开 NAND 控制器。
+在 NAND 版机器上关掉 eMMC 没有任何损失，它本来就找不到卡。
+SD 卡槽在 `&sdio` 上，不受影响。
+
+开起来之后跑 `ws1508-nand-probe`：它只读，会打印几何参数、时钟频率、
+中断计数，也可以把开头 100 个块 dump 成文件。
+如果压根没有 `/dev/mtd0`，那也是一种结果，见下面「已知没验证过的地方」。
+
+默认是**只读**的。要写必须显式加 `meson_nand.allow_write=1`，
+而且即便加了，驱动仍然会挡掉落在厂商引导区里的擦写请求
+（前 1024 页 + 64 个块，数值是从芯片自己上报的页/块大小算出来的）。
+这道保护本身也**没有在实机上验证过**。
+
+> ⚠️ 镜像里装了 `mtd-utils`（`ws1508-nand-probe` 要用它的 `nanddump`）。
+> Debian / Ubuntu 是一个合并的包，所以 `flash_erase`、`nandwrite`、
+> `nandtest`、`ubiformat` 也一并装进来了 —— 内核没开 `MTD_UBI` 挡不住
+> `ubiformat`，它是直接对 `/dev/mtdN` 发 `MEMERASE` / `MEMWRITE`。
+> **别把这些工具指向 `/dev/mtd0`。** 内核里那道写保护是唯一的拦阻，
+> 而它没在实机上验证过。要读就只用 `nanddump`。
+
+### 开之前
+
+1. 确认 Amlogic USB Burning Tool 那条路是通的（见 `flashing.md`）。
+   它是唯一的救砖通道。
+2. 想清楚 `nkey` / `nsec` 这件事。厂商保留区里有一份一机一份的
+   `nkey` / `nsec`，烧录包里没有、工具也生成不出来 —— 覆盖掉就是永久丢失。
+
+关于第 2 条，有一件事必须说清楚，因为本文档早先版本把它写反了：
+
+> **`ws1508-nand-probe` dump 出来的东西不是备份，是诊断样本。**
+> 它的用途是和厂商 U-Boot 读出来的同一段做对照，判断驱动读得对不对。
+> 三条理由：
+>
+> - ECC 强度和加扰器设置**还没被证实**和厂商一致（设备树里 ECC 是故意
+>   没写死的），所以 dump 出来的内容本身就可能是错的；
+> - `nanddump` 不加 `--omitoob` / `--noecc` 时**不含 OOB**，
+>   而这块区域的元数据就在 OOB 里；
+> - 本项目**没有任何**能把这块区域写回去的东西：驱动会挡掉落在
+>   厂商引导区里的擦写请求，加 `meson_nand.allow_write=1` 也不放行。
+>
+> 换句话说：拿着这个 dump 不等于 `nkey` / `nsec` 安全了。
+> 如果你要的是真能写回去的备份，得用厂商 U-Boot 的
+> `amlnf` / `store` 命令去读（需要串口），
+> 而且**怎么写回去、写回去管不管用，本项目没有验证过**。
+
+关于内存踩踏：2019 年那次移植是靠 `CONFIG_SLUB_DEBUG_ON=y` 才发现 DMA
+越界的，不开的话内存被踩了也不报，要等到某个不相干的 `kfree()` 炸掉才知道。
+**但发布镜像的内核没有开这个选项**，所以「先弄一个带 SLUB debug 的内核」
+不是照着上面那条一行开启法就能做到的事。两条现实的路：
+
+- 自己本地编译：在 `userpatches/extensions/ws1508-nand.sh` 的
+  `custom_kernel_config__ws1508_nand()` 里加
+  `kernel_config_set_y SLUB_DEBUG` 和 `kernel_config_set_y SLUB_DEBUG_ON`，
+  再按 README 的「本地编译」编一版。这条路本项目没有实际跑过。
+- 用发布镜像：那就把判据换掉 —— 开了这个设备树之后，
+  内核**任何**莫名其妙的 oops（哪怕调用栈里和 NAND 毫无关系）
+  都先按 DMA 越界处理并反馈，别当成不相干的问题排查。
+
+### 闪存到底是哪颗，未知
+
+NAND 版上那颗芯片印的是迅雷自己的料号（例如 `WS1508CRA10L`），
+查不到规格。想知道真实型号，在 U-Boot 命令行里跑：
+
+```
+amlnf chipinfo
+```
+
+本项目的 U-Boot 保留了 `amlnf` 命令（`drivers/amlnf/dev/cmd_amlnf.c`）。
+**这一步需要串口**——它是全文里少数几个真的绕不过串口的场合之一。
+不想接串口的话，也可以直接看驱动 attach 时打印的那行，信息基本够用，
+只是拿不到厂商料号。
+
+几何参数一出来，有三个判断可以立刻做——驱动在 attach 时会打印一行
+`page ... oob ... erase ... ecc ... bch ... clk ...`，照着看：
+
+| 看到什么 | 结论 |
+|---|---|
+| `page` > 4096 | 厂商是用 `AML_NAND_NEW_OOB` 模式写的，主线驱动复现不了这种排布 |
+| `page` + `oob` > 16383 | `meson_nand_attach_chip()` 直接拒绝，raw 模式一次传不完一页 |
+| `oob` 大小 | 决定能选多强的 ECC：厂商的规则是 `oobsize / 步数 >= ecc_bytes + 2` |
+
+设备树里 ECC 是**故意没写死**的，等实机读出几何参数之后再填
+`nand-ecc-step-size` 和 `nand-ecc-strength`。
+
+### 已知没验证过的地方
+
+这一节是整个 NAND 部分里最重要的一节。**本项目没有 WS1508 实机**，
+下面每一条都没有在真芯片上跑过。
+
+- 主线 meson-nand **从来没有**在 meson8b 芯片上跑过。2019 年唯一一次尝试
+  是在 Meson8m2 上，而且没进主线。
+- **可能根本没有 `/dev/mtd0`。** `nand_scan()` 有可能枚举不出这颗芯片
+  （时钟、引脚复用、R/B 等待、DMA 任何一环不对都会），
+  那样开了设备树也什么都不会出现。这不是「回归」，是还没验证过的东西没跑通。
+- **就算出来了，读到的内容也可能是错的。** 厂商写过的页用硬件 ECC 读回来
+  纠不动，是 ECC 强度 / 加扰器设置还没对上的**预期结果**，
+  不能直接当成「闪存坏了」。设备树里 ECC 故意没写死，就是等实机数据。
+- 中断号 GIC_SPI 34 是从 Amlogic 的头文件里读出来的，没有实测过。
+  所以驱动默认**不用中断**，用软件轮询等 ready（厂商自己的 m8 驱动也是
+  无条件走这条路的）。想试中断加 `meson_nand.use_irq_rb=1`。
+- 那个 DMA 越界至今没有官方解释。这里要说明来源：
+  「2019 年在 Meson8m2 上移植时报给 Amlogic、其 NFC 作者转给了内部 VLSI 团队、
+  一直没有回音，256 字节够用、512 字节看不到更多」这一串说法是
+  **转述的二手信息，本项目没有复现过，也没有找到可引用的邮件列表存档链接**。
+  补丁的做法是给它一整页，属于对着一个没有文档的硬件行为下的保守猜测。
+- 厂商引导区写保护的边界（前 1024 页 + 64 个块）是按芯片**自报**的
+  页/块大小算出来的。如果 `nand_scan()` 把几何认小了，这个边界会跟着缩水，
+  而真实的厂商区不会。
+
+---
+
 ## 串口（大多数情况下你不需要它）
 
 先说结论：**正常刷机、验证、日常使用都不用接串口。**
@@ -134,8 +316,9 @@ cat /proc/cmdline | tr ' ' '\n' | grep ws1508.store
 | 从哪个介质启动的 | `ws1508-info` 会打印当前根设备 |
 
 也就是说：**只要机器能拿到 IP，你就不需要串口。**
-真正需要串口的只有一种情况——刷完完全不亮、也不上网，
-那时候串口是唯一能看到 U-Boot 说了什么的手段。
+真正绕不过串口的只有两种情况：刷完完全不亮、也不上网（那时候串口是唯一
+能看到 U-Boot 说了什么的手段），以及想用 `amlnf chipinfo` 问 U-Boot
+内置闪存到底是哪一颗（见上文「裸 NAND」）。
 
 ### 焊盘位置
 
@@ -196,7 +379,7 @@ cat /proc/cmdline | tr ' ' '\n' | grep ws1508.store
 | 网口 | ✅ `dwmac-meson`，RMII 100M |
 | USB | ✅ `dwc2`，含 USB 存储 |
 | SD / eMMC | ✅ `meson-mx-sdio` / `meson-mx-sdhc` |
-| 裸 NAND | ❌ **无驱动**（`meson_nand.c` 只支持 gxl / axg） |
+| 裸 NAND | ⚠️ **实验性且未在实机验证**，本项目自带补丁把 meson8/meson8b 加进 `meson_nand.c`；默认关闭、默认只读。本项目**没有实现**从它启动的路径（引导端能读裸 NAND，缺的是启动脚本和根文件系统方案）。见上文「裸 NAND：能做什么、不能做什么」 |
 | HDMI | — 内核有 `drm/meson`，但**这块板子没有视频输出**，用不上 |
 | 温度传感 | ⚠️ meson8b 支持有限 |
 | GPU (Mali-450) | ⚠️ lima 驱动，对这机器没什么意义 |

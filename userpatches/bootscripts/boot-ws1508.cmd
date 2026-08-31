@@ -101,9 +101,57 @@ setenv bootargs "${bootargs} ws1508.store=${store}"
 # header (Armbian builds meson with LOADADDR=0x00208000) and moves the
 # fdt/initrd within the bootmap, which CONFIG_SYS_BOOTMAPSZ caps at the
 # real 512MB.
+
+# Which device tree to load.
+#
+# The default is the eMMC variant, which is also the right thing on a NAND
+# unit: there the SD/eMMC controller simply finds no card, and everything
+# else on the board is identical. A NAND unit that wants its internal
+# flash visible as a read-only /dev/mtd0 sets
+#
+#   fdtfile=meson8b-ws1508-nand.dtb
+#
+# in armbianEnv.txt. That is deliberately NOT selected automatically from
+# ${store}: enabling the NAND controller makes the kernel run nand_scan()
+# over the vendor flash with a driver that has never been exercised on
+# this silicon, and nobody should get that without asking for it.
+#
+# It does not make the box boot from NAND either, but not for the reason
+# this comment used to give. This bootloader CAN read raw NAND: "store
+# read <name> <addr> <off> <size>" forwards to "amlnf read_byte" on a
+# NAND unit, which is how the vendor firmware boots. What it lacks is a
+# filesystem layer over NAND (CONFIG_NEXT_NAND drops libmtd.o/libnand.o),
+# so fatload cannot work there -- and this script has no store-read
+# branch. Every load below is a fatload from ${bootdev}. Booting from
+# internal NAND is unimplemented here, not impossible; it would need a
+# store-read variant of these three loads plus offsets that match the
+# vendor partition table, and a rootfs story Linux does not have yet.
+#
+# Nothing but the user is expected to write this variable: Armbian
+# appends an fdtfile= line to armbianEnv.txt when the board config sets
+# BOOT_FDT_FILE, and ws1508.conf deliberately does not. That is read from
+# Armbian's bootscript handling and has not been re-verified against a
+# checkout in this tree, so if a future Armbian starts emitting the line
+# unconditionally, the default dtb below stops being the default -- worth
+# checking if an eMMC unit ever comes up with the NAND dtb. `test -z` is
+# broken in this u-boot, hence the `test -n ... ||` form used elsewhere.
+test -n "${fdtfile}" || setenv fdtfile meson8b-ws1508.dtb
+
+# Refuse the NAND device tree on a unit whose own bootloader did not find
+# raw NAND. meson8b-ws1508-nand.dts sets &sdhc to disabled, so on an eMMC
+# unit that dtb removes the very controller the rootfs lives behind: the
+# kernel boots and then panics with no root device, and the box is fixed
+# only by putting the card in another machine to edit armbianEnv.txt.
+# ${store} is the bootloader's own detection result and costs nothing to
+# consult, so a typo in armbianEnv.txt degrades to "the NAND dtb was
+# ignored" instead of "the box no longer boots". Chained `test ... &&`
+# rather than `if`, matching the form used above; `test -z` is broken in
+# this u-boot.
+test "${fdtfile}" = "meson8b-ws1508-nand.dtb" && test "${store}" != "1" && echo "ws1508: ${fdtfile} needs a raw-NAND unit (store=${store}) - falling back to meson8b-ws1508.dtb" && setenv fdtfile meson8b-ws1508.dtb
+
 fatload ${bootdev} 0x16000000 /uImage || exit 1
 fatload ${bootdev} 0x1a800000 /uInitrd || exit 1
-fatload ${bootdev} 0x1a000000 /dtb/meson8b-ws1508.dtb || exit 1
+fatload ${bootdev} 0x1a000000 /dtb/${fdtfile} || exit 1
 
 bootm 0x16000000 0x1a800000 0x1a000000
 

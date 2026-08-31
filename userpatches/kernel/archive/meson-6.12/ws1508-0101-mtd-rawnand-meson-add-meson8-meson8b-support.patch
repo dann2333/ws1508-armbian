@@ -1,0 +1,616 @@
+Subject: mtd: rawnand: meson: add Meson8 / Meson8b support
+
+Meson8 (S802), Meson8b (S805) and Meson8m2 (S812) carry the same NAND
+flash controller as GXL. Every register offset matches, and so does
+every command bit this driver emits, including the M8-specific BCH
+numbering: NFC_ECC_BCH8_512=1 .. NFC_ECC_BCH60_1K=7 here is byte for
+byte the CONFIG_NAND_AML_M8 branch of Amlogic's own driver
+(drivers/amlnf/include/hw_ctrl.h). Nothing in the command path needs to
+change.
+
+NONE OF THIS HAS BEEN RUN ON MESON8-FAMILY SILICON. Mainline meson-nand
+has never been reported working on any of these SoCs, no Meson8b board
+has ever carried an NFC node, and the author of this patch has no such
+hardware. Everything below is derived from Amlogic's own vendor sources
+and from the clock and pinctrl drivers already in mainline; it is not a
+report of anything observed. The next patch makes that operationally
+true as well by keeping the MTD read-only by default on this family.
+
+What differs from GXL is everything around the controller, so this turns
+the single-field struct meson_nfc_data into a real per-SoC description:
+
+  uses_emmc_clk_reg  GXL and AXG have no NAND clock of their own and
+                     divide SD_EMMC_C's instead, which is why probe maps
+                     a second "emmc" register and clk_init builds a
+                     private divider on it. Meson8b has the real thing:
+                     nand_clk_sel -> nand_clk_div -> nand_clk_gate on
+                     HHI_NAND_CLK_CNTL, already modelled in
+                     drivers/clk/meson/meson8b.c, all three carrying
+                     CLK_SET_RATE_PARENT. So "device" is already the
+                     rate-settable clock and there is nothing to map.
+
+                     Pointing an "emmc" reg at HHI_NAND_CLK_CNTL instead
+                     would be actively harmful: the raw
+                     BIT(31)|BIT(24)|BIT(6) write means divider 64 and
+                     "NAND clock gate off" in that register's layout,
+                     and it would desynchronise clk_regmap's cache.
+
+  soft_waitrdy       Amlogic's m8 driver sets NAND_CTRL_NONE_RB
+                     unconditionally, compiles the R/B autodetect out and
+                     leaves the request_irq() commented out
+                     (drivers/amlnf/phy/hw_controller.c, phy/chip.c), so
+                     the interrupt path has never run on this silicon and
+                     no device tree carries a number for it. Poll with
+                     nand_soft_waitrdy() instead, make the interrupt
+                     optional in probe, and do not even request it when
+                     the driver is going to poll: a handler on a line
+                     nothing arms is a liability, not a fallback.
+                     meson_nand.use_irq_rb=1 exists so somebody with the
+                     hardware can add an interrupts property locally and
+                     find out what the number is.
+
+  always_scramble    hw_controller.c sets controller->ran_mode = 1 for
+                     every page it ever writes. Pages the bootloader
+                     wrote therefore only read back as anything but noise
+                     if the scrambler is on here too, and there is no DT
+                     property and no nand_base quirk that can say so.
+
+  boot_page_bch      The short/boot-page mode is hardcoded to
+                     NFC_ECC_BCH8_1K, which is the GXL ROM's choice. The
+                     M8 ROM uses BCH60_1K (hw_controller.c maps
+                     NAND_ECC_BCH_SHORT to NAND_ECC_BCH60_1K).
+
+  new_oob_over_4k    For a page larger than 4KiB the vendor code puts the
+                     controller into its "new OOB" mode -- NFC_REG_CFG
+                     bits 26:27, info buffer shifted by two entries, OOB
+                     bytes as one flat 16-byte block at the front
+                     (hw_controller.c, guarded by AML_NAND_NEW_OOB and
+                     CONFIG_NAND_AML_M8). This driver models none of it
+                     and meson_nfc_select_chip() actively clears those
+                     CFG bits, so every vendor-written page on such a
+                     part would come back with wrong OOB and an ECC
+                     status read from the wrong words. Refuse to attach
+                     rather than return plausible rubbish.
+
+  experimental       Consumed by the next patch.
+
+Two things are deliberately NOT per-SoC.
+
+The NFC round-trip delay stays at NFC_DEFAULT_DELAY. The obvious
+candidate for an M8-specific value, NAND_CYCLE_DELAY, exists three times
+in Amlogic's tree with three different values -- 84 in
+drivers/amlnf/include/hw_ctrl.h, 90 in
+arch/arm/include/asm/arch-m8b/aml_nand.h, 100 in
+arch/arm/include/asm/arch-m8b/nand.h -- and the same trio appears
+verbatim for m6, m8, m8b, g9b and g9tv, so none of them is m8b-specific.
+The 84 is inside code the M8 build never executes: both of its users in
+hw_controller.c sit in `#if 0` blocks and the live path hardcodes
+bus_cycle and bus_timing instead. A previous version of this patch used
+8400ps on the strength of that constant; on a chip at tRC_min = 20ns
+that moves the RE sample point two NFC clocks later than the GXL figure
+would, which on a 250MHz bus is most of the data-valid window. Keep the
+value that is known to work somewhere until somebody measures this one.
+
+The raw scrambler stays symmetric, which does NOT match the vendor, and
+that is deliberate. Amlogic's controller_dma_write() issues raw writes as
+NFC_SEND_CMD_M2N_RAW(0, len) -- scrambler hard-off -- while
+controller_dma_read() issues raw reads as
+NFC_SEND_CMD_N2M_RAW(controller->ran_mode, len) with ran_mode = 1, and
+the OOB tail fill three lines below the raw write uses ran_mode as well.
+So the vendor's own raw path does not round-trip and contradicts itself
+inside one function; copying it would give this driver a raw write whose
+data its own raw read cannot recover, which breaks nandwrite --raw
+followed by nanddump --raw, and it would not make a restore work either
+(a vendor raw read returns descrambled bytes, so writing them back
+unscrambled does not reproduce what was on the chip). Recording it here
+instead: MTD_OPS_RAW writes through this driver are self-consistent but
+are not byte-compatible with what Amlogic's ECC-NONE write path puts on
+the flash.
+
+Separately, fix a bug the meson8b clock tree makes reachable.
+meson_nfc_setup_interface() computed meson_chip->clk_rate as
+1000000000 / div and assumed it would be granted exactly. That holds on
+GXL and AXG, where the driver pins the divider's parent to a fixed 1GHz
+and registers a plain divider. It does not hold on Meson8b, where
+nand_clk_sel and nand_clk_div both carry ROUND_CLOSEST and are therefore
+allowed to settle above the requested rate -- i.e. to run the bus faster
+than the chip's tRC_min, with no error from any clk API and no symptom
+except intermittent uncorrectable ECC. Ask the clock what it will
+actually give, refuse anything faster than requested, and re-derive the
+nanoseconds-per-clock the rest of the function assumes from the answer.
+On GXL and AXG clk_round_rate() returns the request unchanged and every
+derived value is bit-identical to before.
+
+pinctrl-meson8b.c already carries the complete "nand" function and
+include/dt-bindings/clock/meson8b-clkc.h already exposes CLKID_NAND,
+CLKID_NAND_SEL/DIV/CLK, so no other subsystem needs touching.
+
+Also print one geometry/ECC/clock line at attach time. On a board whose
+flash is a house-marked die of unknown part number this is the only way
+to tell from a boot log whether the clock, the pinmux and the ECC choice
+came out right.
+
+diff --git a/drivers/mtd/nand/raw/meson_nand.c b/drivers/mtd/nand/raw/meson_nand.c
+index df783a9..c8ae763 100644
+--- a/drivers/mtd/nand/raw/meson_nand.c
++++ b/drivers/mtd/nand/raw/meson_nand.c
+@@ -144,6 +144,18 @@
+ #define NFC_COLUMN_ADDR_0	0
+ #define NFC_COLUMN_ADDR_1	0
+ 
++/*
++ * Off by default on every SoC that sets .soft_waitrdy.  No Amlogic code has
++ * ever enabled the NFC ready/busy interrupt on the M8 family, and no meson8b
++ * device tree carries an interrupt for this controller, so the polling path is
++ * the only one with any evidence behind it.  This exists so that somebody with
++ * the hardware can add an interrupts property locally and find out.
++ */
++static bool meson_nfc_use_irq_rb;
++module_param_named(use_irq_rb, meson_nfc_use_irq_rb, bool, 0444);
++MODULE_PARM_DESC(use_irq_rb,
++		 "Wait for ready with the NFC R/B interrupt instead of polling, on SoCs that default to polling (UNVERIFIED on Meson8/8b)");
++
+ struct meson_nfc_nand_chip {
+ 	struct list_head node;
+ 	struct nand_chip nand;
+@@ -172,6 +184,25 @@ struct meson_nand_ecc {
+ 
+ struct meson_nfc_data {
+ 	const struct nand_ecc_caps *ecc_caps;
++	/* the NFC clock is divided inside the borrowed SD_EMMC_C register */
++	bool uses_emmc_clk_reg;
++	/* no vendor code has ever enabled the R/B interrupt here, so poll */
++	bool soft_waitrdy;
++	/*
++	 * vendor code scrambles every page it writes, so pages it wrote only
++	 * read back as anything but noise when the scrambler is on here too
++	 */
++	bool always_scramble;
++	/* this SoC's port has never been validated on real silicon */
++	bool experimental;
++	/*
++	 * M8 family: for a page larger than 4KiB the vendor code puts the
++	 * controller into its "new OOB" mode, which this driver cannot read
++	 * (see meson_nand_attach_chip())
++	 */
++	bool new_oob_over_4k;
++	/* BCH code the boot ROM uses for the short-mode pages */
++	u8 boot_page_bch;
+ };
+ 
+ struct meson_nfc_param {
+@@ -223,6 +254,7 @@ struct meson_nfc {
+ 
+ 	unsigned long assigned_cs;
+ 	bool no_rb_pin;
++	bool use_soft_waitrdy;
+ };
+ 
+ enum {
+@@ -389,7 +421,7 @@ static void meson_nfc_cmd_access(struct nand_chip *nand, int raw, bool dir, int
+ 		pages = mtd->writesize / NFC_MIN_ECC_UNIT;
+ 
+ 		scrambler = NFC_CMD_SCRAMBLER_ENABLE;
+-		cmd = CMDRWGEN(DMA_DIR(dir), scrambler, NFC_ECC_BCH8_1K,
++		cmd = CMDRWGEN(DMA_DIR(dir), scrambler, nfc->data->boot_page_bch,
+ 			       NFC_CMD_SHORTMODE_ENABLE, pagesize, pages);
+ 	} else {
+ 		pagesize = nand->ecc.size >> 3;
+@@ -568,6 +600,33 @@ static int meson_nfc_queue_rb(struct nand_chip *nand, int timeout_ms,
+ {
+ 	struct meson_nfc *nfc = nand_get_controller_data(nand);
+ 
++	if (nfc->use_soft_waitrdy) {
++		dma_addr_t daddr = nfc->daddr;
++		dma_addr_t iaddr = nfc->iaddr;
++		u32 info_bytes = nfc->info_bytes;
++		int ret;
++
++		meson_nfc_cmd_idle(nfc, nfc->timing.twb);
++		meson_nfc_drain_cmd(nfc);
++		meson_nfc_wait_cmd_finish(nfc, CMD_FIFO_EMPTY_TIMEOUT);
++
++		ret = nand_soft_waitrdy(nand, timeout_ms);
++
++		/*
++		 * nand_soft_waitrdy() re-enters ->exec_op(), whose DATA_IN path
++		 * maps and unmaps buffers of its own through these three
++		 * controller-wide fields.  meson_nfc_write_page_sub() calls us
++		 * with its own page mapping still live, so hand its addresses
++		 * back or its release would unmap the inner buffer twice and leak
++		 * the page.
++		 */
++		nfc->daddr = daddr;
++		nfc->iaddr = iaddr;
++		nfc->info_bytes = info_bytes;
++
++		return ret;
++	}
++
+ 	if (nfc->no_rb_pin) {
+ 		/* This mode is used when there is no wired R/B pin.
+ 		 * It works like 'nand_soft_waitrdy()', but instead of
+@@ -1225,31 +1284,47 @@ static int meson_nfc_clk_init(struct meson_nfc *nfc)
+ 		return PTR_ERR(nfc->device_clk);
+ 	}
+ 
+-	init.name = devm_kasprintf(nfc->dev,
+-				   GFP_KERNEL, "%s#div",
+-				   dev_name(nfc->dev));
+-	if (!init.name)
+-		return -ENOMEM;
++	if (nfc->data->uses_emmc_clk_reg) {
++		init.name = devm_kasprintf(nfc->dev,
++					   GFP_KERNEL, "%s#div",
++					   dev_name(nfc->dev));
++		if (!init.name)
++			return -ENOMEM;
+ 
+-	init.ops = &clk_divider_ops;
+-	nfc_divider_parent_data[0].fw_name = "device";
+-	init.parent_data = nfc_divider_parent_data;
+-	init.num_parents = 1;
+-	nfc->nand_divider.reg = nfc->reg_clk;
+-	nfc->nand_divider.shift = CLK_DIV_SHIFT;
+-	nfc->nand_divider.width = CLK_DIV_WIDTH;
+-	nfc->nand_divider.hw.init = &init;
+-	nfc->nand_divider.flags = CLK_DIVIDER_ONE_BASED |
+-				  CLK_DIVIDER_ROUND_CLOSEST |
+-				  CLK_DIVIDER_ALLOW_ZERO;
+-
+-	nfc->nand_clk = devm_clk_register(nfc->dev, &nfc->nand_divider.hw);
+-	if (IS_ERR(nfc->nand_clk))
+-		return PTR_ERR(nfc->nand_clk);
+-
+-	/* init SD_EMMC_CLOCK to sane defaults w/min clock rate */
+-	writel(CLK_ALWAYS_ON_NAND | CLK_SELECT_NAND | CLK_SELECT_FIX_PLL2,
+-	       nfc->reg_clk);
++		init.ops = &clk_divider_ops;
++		nfc_divider_parent_data[0].fw_name = "device";
++		init.parent_data = nfc_divider_parent_data;
++		init.num_parents = 1;
++		nfc->nand_divider.reg = nfc->reg_clk;
++		nfc->nand_divider.shift = CLK_DIV_SHIFT;
++		nfc->nand_divider.width = CLK_DIV_WIDTH;
++		nfc->nand_divider.hw.init = &init;
++		nfc->nand_divider.flags = CLK_DIVIDER_ONE_BASED |
++					  CLK_DIVIDER_ROUND_CLOSEST |
++					  CLK_DIVIDER_ALLOW_ZERO;
++
++		nfc->nand_clk = devm_clk_register(nfc->dev,
++						  &nfc->nand_divider.hw);
++		if (IS_ERR(nfc->nand_clk))
++			return PTR_ERR(nfc->nand_clk);
++
++		/* init SD_EMMC_CLOCK to sane defaults w/min clock rate */
++		writel(CLK_ALWAYS_ON_NAND | CLK_SELECT_NAND |
++		       CLK_SELECT_FIX_PLL2, nfc->reg_clk);
++	} else {
++		/*
++		 * The M8 family has a NAND clock tree of its own in the clock
++		 * controller (nand_clk_sel -> nand_clk_div -> nand_clk_gate on
++		 * HHI_NAND_CLK_CNTL, drivers/clk/meson/meson8b.c), so "device"
++		 * already is the rate-settable clock and there is no second
++		 * register to divide in.  Borrowing the branch above would be
++		 * worse than redundant: those three bits mean divide-by-64 and
++		 * "gate the NAND clock off" in HHI_NAND_CLK_CNTL's layout, and
++		 * writing them raw would leave clk_regmap's cached state
++		 * describing something else.
++		 */
++		nfc->nand_clk = nfc->device_clk;
++	}
+ 
+ 	ret = clk_prepare_enable(nfc->core_clk);
+ 	if (ret) {
+@@ -1263,10 +1338,12 @@ static int meson_nfc_clk_init(struct meson_nfc *nfc)
+ 		goto err_device_clk;
+ 	}
+ 
+-	ret = clk_prepare_enable(nfc->nand_clk);
+-	if (ret) {
+-		dev_err(nfc->dev, "pre enable NFC divider fail\n");
+-		goto err_nand_clk;
++	if (nfc->nand_clk != nfc->device_clk) {
++		ret = clk_prepare_enable(nfc->nand_clk);
++		if (ret) {
++			dev_err(nfc->dev, "pre enable NFC divider fail\n");
++			goto err_nand_clk;
++		}
+ 	}
+ 
+ 	ret = clk_set_rate(nfc->nand_clk, 24000000);
+@@ -1276,7 +1353,8 @@ static int meson_nfc_clk_init(struct meson_nfc *nfc)
+ 	return 0;
+ 
+ err_disable_clk:
+-	clk_disable_unprepare(nfc->nand_clk);
++	if (nfc->nand_clk != nfc->device_clk)
++		clk_disable_unprepare(nfc->nand_clk);
+ err_nand_clk:
+ 	clk_disable_unprepare(nfc->device_clk);
+ err_device_clk:
+@@ -1286,7 +1364,9 @@ err_device_clk:
+ 
+ static void meson_nfc_disable_clk(struct meson_nfc *nfc)
+ {
+-	clk_disable_unprepare(nfc->nand_clk);
++	/* on the M8 family nand_clk *is* device_clk; do not drop it twice */
++	if (nfc->nand_clk != nfc->device_clk)
++		clk_disable_unprepare(nfc->nand_clk);
+ 	clk_disable_unprepare(nfc->device_clk);
+ 	clk_disable_unprepare(nfc->core_clk);
+ }
+@@ -1337,13 +1417,52 @@ static int meson_chip_buffer_init(struct nand_chip *nand)
+ 	return 0;
+ }
+ 
++/*
++ * Largest rate the clock tree can actually produce that is not faster than
++ * @max.  On GXL/AXG this is exact and the loop runs once: the driver pins the
++ * divider's parent to a fixed 1GHz and registers its own divider, so
++ * clk_round_rate() returns 1e9/div unchanged.  On Meson8/8b nand_clk_sel and
++ * nand_clk_div both carry ROUND_CLOSEST (drivers/clk/meson/meson8b.c) and are
++ * therefore allowed to settle ABOVE the requested rate -- which here means
++ * running the bus faster than the chip's tRC_min, a violation that no clk API
++ * reports and that shows up only as intermittent uncorrectable ECC.
++ */
++static unsigned long meson_nfc_clk_rate_at_most(struct meson_nfc *nfc,
++						unsigned long max)
++{
++	unsigned long req = max;
++	long rate;
++	int i;
++
++	for (i = 0; i < 4 && req; i++) {
++		rate = clk_round_rate(nfc->nand_clk, req);
++		if (rate <= 0)
++			return 0;
++		if (rate <= max)
++			return rate;
++		/*
++		 * A round-to-closest clock only answers above the request when
++		 * the next reachable rate below is at least as far away, i.e.
++		 * lower <= 2 * req - rate.  Aim just under that so the next
++		 * query cannot pick the same rate again.
++		 */
++		if ((unsigned long)rate >= 2 * req)
++			break;
++		req = 2 * req - rate - 1;
++	}
++
++	return 0;
++}
++
+ static
+ int meson_nfc_setup_interface(struct nand_chip *nand, int csline,
+ 			      const struct nand_interface_config *conf)
+ {
+ 	struct meson_nfc_nand_chip *meson_chip = to_meson_nand(nand);
++	struct meson_nfc *nfc = nand_get_controller_data(nand);
+ 	const struct nand_sdr_timings *timings;
+ 	u32 div, bt_min, bt_max, tbers_clocks;
++	unsigned long rate;
+ 
+ 	timings = nand_get_sdr_timings(conf);
+ 	if (IS_ERR(timings))
+@@ -1353,6 +1472,25 @@ int meson_nfc_setup_interface(struct nand_chip *nand, int csline,
+ 		return 0;
+ 
+ 	div = DIV_ROUND_UP((timings->tRC_min / 1000), NFC_CLK_CYCLE);
++
++	/*
++	 * Everything below models one NFC clock as exactly @div nanoseconds,
++	 * which only holds if the clock tree can produce 1e9/div Hz.  Ask it
++	 * what it will really give us, refuse anything faster (that would run
++	 * the bus below tRC_min), and re-derive @div from the answer so the
++	 * DIV_ROUND_UP()s below over-wait rather than under-wait.
++	 */
++	rate = meson_nfc_clk_rate_at_most(nfc, 1000000000L / div);
++	if (!rate) {
++		dev_err(nfc->dev,
++			"no reachable NFC clock at or below %lu Hz (tRC_min %u ps)\n",
++			1000000000L / div, timings->tRC_min);
++		return -EINVAL;
++	}
++	div = 1000000000L / rate;
++	if (!div)
++		return -EINVAL;
++
+ 	bt_min = (timings->tREA_max + NFC_DEFAULT_DELAY) / div;
+ 	bt_max = (NFC_DEFAULT_DELAY + timings->tRHOH_min +
+ 		  timings->tRC_min / 2) / div;
+@@ -1374,7 +1512,7 @@ int meson_nfc_setup_interface(struct nand_chip *nand, int csline,
+ 		return -EINVAL;
+ 
+ 	meson_chip->level1_divider = div;
+-	meson_chip->clk_rate = 1000000000 / meson_chip->level1_divider;
++	meson_chip->clk_rate = rate;
+ 	meson_chip->bus_timing = (bt_min + bt_max) / 2 + 1;
+ 
+ 	return 0;
+@@ -1428,11 +1566,45 @@ static int meson_nand_attach_chip(struct nand_chip *nand)
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * On the M8 family the vendor code switches the controller into its
++	 * "new OOB" mode for any chip with a page larger than 4KiB
++	 * (drivers/amlnf/phy/hw_controller.c: NFC_SET_OOB_MODE(3 << 26) when
++	 * flash->pagesize > 4096, guarded by AML_NAND_NEW_OOB and
++	 * CONFIG_NAND_AML_M8).  In that mode the info buffer gains two leading
++	 * 8-byte entries, the per-sector ECC status words start 16 bytes in,
++	 * and the user/OOB bytes become a flat 16-byte block at the front
++	 * instead of two bytes per ECC step.
++	 *
++	 * This driver models none of that: it never touches NFC_REG_CFG bits
++	 * 26:27 -- meson_nfc_select_chip() writes that register wholesale and
++	 * so actively clears them -- and reads the status words and user bytes
++	 * from entry 0 onwards.  Every page the vendor wrote on such a part
++	 * would therefore come back with wrong OOB and an ECC status read from
++	 * the wrong words.  Refuse instead of returning plausible rubbish.
++	 */
++	if (nfc->data->new_oob_over_4k && mtd->writesize > 4096) {
++		dev_err(nfc->dev,
++			"%u byte page: the vendor wrote this chip in the M8 \"new OOB\" layout, which this driver does not implement\n",
++			mtd->writesize);
++		return -EOPNOTSUPP;
++	}
++
+ 	if (nand->bbt_options & NAND_BBT_USE_FLASH)
+ 		nand->bbt_options |= NAND_BBT_NO_OOB;
+ 
+ 	nand->options |= NAND_NO_SUBPAGE_WRITE;
+ 
++	/*
++	 * There is no DT property and no nand_base quirk that can express this:
++	 * the M8 vendor driver turns the scrambler on for every page it ever
++	 * writes (drivers/amlnf/phy/hw_controller.c sets controller->ran_mode
++	 * unconditionally), so pages written by the bootloader only read back as
++	 * anything but noise when the scrambler is on here too.
++	 */
++	if (nfc->data->always_scramble)
++		nand->options |= NAND_NEED_SCRAMBLING;
++
+ 	ret = nand_ecc_choose_conf(nand, nfc->data->ecc_caps,
+ 				   mtd->oobsize - 2);
+ 	if (ret) {
+@@ -1465,6 +1637,18 @@ static int meson_nand_attach_chip(struct nand_chip *nand)
+ 	if (ret)
+ 		return -ENOMEM;
+ 
++	/*
++	 * Everything a first bring-up on new silicon needs in order to decide
++	 * whether the clock, the pinmux and the ECC choice came out right, on
++	 * one line, so it can be read out of a boot log instead of a debugger.
++	 */
++	dev_info(nfc->dev,
++		 "page %u oob %u erase %u ecc %d/%d bch %u scramble %d clk %lu Hz\n",
++		 mtd->writesize, mtd->oobsize, mtd->erasesize,
++		 nand->ecc.size, nand->ecc.strength, meson_chip->bch_mode,
++		 !!(nand->options & NAND_NEED_SCRAMBLING),
++		 clk_get_rate(nfc->nand_clk));
++
+ 	return ret;
+ }
+ 
+@@ -1620,10 +1804,47 @@ static irqreturn_t meson_nfc_irq(int irq, void *id)
+ 
+ static const struct meson_nfc_data meson_gxl_data = {
+ 	.ecc_caps = &meson_gxl_ecc_caps,
++	.uses_emmc_clk_reg = true,
++	.boot_page_bch = NFC_ECC_BCH8_1K,
+ };
+ 
+ static const struct meson_nfc_data meson_axg_data = {
+ 	.ecc_caps = &meson_axg_ecc_caps,
++	.uses_emmc_clk_reg = true,
++	.boot_page_bch = NFC_ECC_BCH8_1K,
++};
++
++/*
++ * Meson8 (S802), Meson8b (S805) and Meson8m2 (S812) share one NFC whose
++ * register map and command encoding are identical to the GXL one; what differs
++ * is everything around it -- its own clock tree instead of a borrowed
++ * SD_EMMC_C divider, a BCH60 boot mode instead of BCH8, an unconditional
++ * scrambler, and a "new OOB" page layout this driver does not implement.
++ *
++ * NOT VALIDATED ON SILICON.  The only reported bring-up on this family was an
++ * out-of-tree Meson8m2 attempt in 2019 that never landed, and no Meson8b board
++ * has ever had an NFC node.  Hence .experimental, which the write protection
++ * in the following patch keys off.
++ *
++ * There is deliberately no per-SoC NFC round-trip delay here.  The obvious
++ * candidate, NAND_CYCLE_DELAY, exists three times in Amlogic's own tree with
++ * three different values (84 in drivers/amlnf/include/hw_ctrl.h, 90 in
++ * arch/arm/include/asm/arch-m8b/aml_nand.h, 100 in
++ * arch/arm/include/asm/arch-m8b/nand.h) and the same trio appears verbatim for
++ * m6/m8/m8b/g9b/g9tv, so none of them is m8b-specific.  The 84 is inside code
++ * the M8 build never executes: both of its users in
++ * drivers/amlnf/phy/hw_controller.c sit in #if 0 blocks, and the live path
++ * hardcodes bus_cycle/bus_timing instead.  So the delay is not derivable from
++ * anything on record; keep the GXL figure (NFC_DEFAULT_DELAY) until somebody
++ * measures it on real silicon.
++ */
++static const struct meson_nfc_data meson8_data = {
++	.ecc_caps = &meson_gxl_ecc_caps,
++	.soft_waitrdy = true,
++	.always_scramble = true,
++	.experimental = true,
++	.new_oob_over_4k = true,
++	.boot_page_bch = NFC_ECC_BCH60_1K,
+ };
+ 
+ static const struct of_device_id meson_nfc_id_table[] = {
+@@ -1633,6 +1854,12 @@ static const struct of_device_id meson_nfc_id_table[] = {
+ 	}, {
+ 		.compatible = "amlogic,meson-axg-nfc",
+ 		.data = &meson_axg_data,
++	}, {
++		.compatible = "amlogic,meson8-nfc",
++		.data = &meson8_data,
++	}, {
++		.compatible = "amlogic,meson8b-nfc",
++		.data = &meson8_data,
+ 	},
+ 	{}
+ };
+@@ -1673,14 +1900,28 @@ static int meson_nfc_probe(struct platform_device *pdev)
+ 	if (IS_ERR(nfc->reg_base))
+ 		return PTR_ERR(nfc->reg_base);
+ 
+-	nfc->reg_clk = devm_platform_ioremap_resource_byname(pdev, "emmc");
+-	if (IS_ERR(nfc->reg_clk))
+-		return PTR_ERR(nfc->reg_clk);
++	if (nfc->data->uses_emmc_clk_reg) {
++		nfc->reg_clk = devm_platform_ioremap_resource_byname(pdev,
++								    "emmc");
++		if (IS_ERR(nfc->reg_clk))
++			return PTR_ERR(nfc->reg_clk);
++	}
+ 
+-	irq = platform_get_irq(pdev, 0);
+-	if (irq < 0)
++	/*
++	 * The software ready/busy path needs no interrupt, and on the M8 family
++	 * no Amlogic code has ever enabled the NFC one -- their driver sets
++	 * NAND_CTRL_NONE_RB unconditionally and leaves the request_irq()
++	 * commented out (drivers/amlnf/phy/chip.c) -- so no meson8/8b device
++	 * tree carries a number for it.  Requiring one would make an unverified
++	 * number a hard dependency.
++	 */
++	irq = platform_get_irq_optional(pdev, 0);
++	if (irq < 0 && !nfc->data->soft_waitrdy)
+ 		return -EINVAL;
+ 
++	nfc->use_soft_waitrdy = nfc->data->soft_waitrdy &&
++				(irq < 0 || !meson_nfc_use_irq_rb);
++
+ 	ret = meson_nfc_clk_init(nfc);
+ 	if (ret) {
+ 		dev_err(dev, "failed to initialize NAND clock\n");
+@@ -1688,11 +1929,20 @@ static int meson_nfc_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	writel(0, nfc->reg_base + NFC_REG_CFG);
+-	ret = devm_request_irq(dev, irq, meson_nfc_irq, 0, dev_name(dev), nfc);
+-	if (ret) {
+-		dev_err(dev, "failed to request NFC IRQ\n");
+-		ret = -EINVAL;
+-		goto err_clk;
++	/*
++	 * Do not take the line at all when the driver is going to poll: an
++	 * interrupt this driver never arms but does hold a handler for is a
++	 * liability on a shared or misdescribed line, and on the M8 family the
++	 * number in any device tree that has one is unverified by definition.
++	 */
++	if (!nfc->use_soft_waitrdy) {
++		ret = devm_request_irq(dev, irq, meson_nfc_irq, 0,
++				       dev_name(dev), nfc);
++		if (ret) {
++			dev_err(dev, "failed to request NFC IRQ\n");
++			ret = -EINVAL;
++			goto err_clk;
++		}
+ 	}
+ 
+ 	ret = dma_set_mask(dev, DMA_BIT_MASK(32));

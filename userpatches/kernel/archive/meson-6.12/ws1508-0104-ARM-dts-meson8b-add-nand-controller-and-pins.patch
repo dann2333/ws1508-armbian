@@ -1,0 +1,127 @@
+Subject: ARM: dts: meson8b: add the NAND controller and its pins
+
+The NFC sits at 0xd0048600, which is offset 0x48600 inside the existing
+apb bus@d0000000 (ranges = <0x0 0xd0000000 0x200000>).
+
+CLKID_NAND is the register-interface gate on HHI_GCLK_MPEG1 bit 24 and
+has to be listed, or clk_disable_unused() switches the controller's
+registers off at late_initcall; CLKID_NAND_CLK is the top of the
+functional tree.
+
+No "interrupts" property. The controller has a ready/busy interrupt, but
+no Amlogic code has ever enabled it on this SoC family and there is no
+in-tree, out-of-tree or vendor device tree from which the GIC number
+could be taken and no board on which it has been seen to fire. The
+driver waits for ready in software on meson8/8b and does not request an
+interrupt at all, so a number here would buy nothing and would risk
+claiming another peripheral's line. Anyone wanting to establish it can
+add the property in a local .dts and boot with meson_nand.use_irq_rb=1.
+
+assigned-clock-parents does less than it looks like it does, and the
+comment says so: nand_clk_sel is a 3-bit mux of which the clock driver
+models only settings 0..4, so this recovers from a bootloader that left
+it at 5..7, but nand_clk_sel carries CLK_SET_RATE_PARENT and not
+CLK_SET_RATE_NO_REPARENT, so the driver's first clk_set_rate()
+reparents away from fclk_div4 again.
+
+Both nodes are disabled/unreferenced, so no existing meson8b board is
+affected. Boards that want the controller must also disable &sdhc:
+BOOT_0..BOOT_10 carry the NAND bus and the sdxc_c bus on the same pads.
+
+Rebase note for downstreams: applied on top of Armbian's meson-6.12
+series, the pinctrl hunk lands with a line offset (0028/0059/0063/0064
+and the onecloud dtsi patches insert nodes above it) and Armbian's
+patching tool records the patch as needing a rebase. That is a log
+annotation, not a failure -- both hunks still match their context --
+but the patch is not anchored against that series and one more inserted
+node in the cbus pinctrl block could turn the offset into a reject.
+
+diff --git a/arch/arm/boot/dts/amlogic/meson8b.dtsi b/arch/arm/boot/dts/amlogic/meson8b.dtsi
+index 2d9d24d..acffd1c 100644
+--- a/arch/arm/boot/dts/amlogic/meson8b.dtsi
++++ b/arch/arm/boot/dts/amlogic/meson8b.dtsi
+@@ -257,6 +257,51 @@
+ 		#size-cells = <1>;
+ 		ranges = <0x0 0xd0000000 0x200000>;
+ 
++		nfc: nand-controller@48600 {
++			compatible = "amlogic,meson8b-nfc";
++			reg = <0x48600 0x100>;
++			reg-names = "nfc";
++			/*
++			 * No "interrupts" here on purpose. The controller does
++			 * have a ready/busy interrupt line, but no Amlogic
++			 * code has ever enabled it on this SoC family -- their
++			 * driver sets NAND_CTRL_NONE_RB unconditionally and
++			 * ships the request_irq() commented out -- so there is
++			 * no in-tree, out-of-tree or vendor device tree from
++			 * which the GIC number could be taken and no board on
++			 * which it has been observed to fire. The driver waits
++			 * for ready in software here and does not request an
++			 * interrupt at all, so an unverified number would buy
++			 * nothing and would risk claiming another peripheral's
++			 * line. Add one locally if you want to measure it.
++			 *
++			 * CLKID_NAND is the register-interface gate on
++			 * HHI_GCLK_MPEG1; without it listed here
++			 * clk_disable_unused() switches the controller's
++			 * registers off at late_initcall. CLKID_NAND_CLK is
++			 * the top of the functional tree.
++			 */
++			clocks = <&clkc CLKID_NAND>,
++				 <&clkc CLKID_NAND_CLK>;
++			clock-names = "core", "device";
++			/*
++			 * nand_clk_sel is a 3-bit mux of which the clock
++			 * driver models only settings 0..4, so a bootloader
++			 * that left it at 5..7 would orphan the clock at
++			 * probe. This only sanitises that: nand_clk_sel
++			 * carries CLK_SET_RATE_PARENT and not
++			 * CLK_SET_RATE_NO_REPARENT, so the driver's first
++			 * clk_set_rate() reparents away from fclk_div4 again
++			 * -- do not expect to find fclk_div4 in
++			 * /sys/kernel/debug/clk/nand_clk_sel later on.
++			 */
++			assigned-clocks = <&clkc CLKID_NAND_SEL>;
++			assigned-clock-parents = <&clkc CLKID_FCLK_DIV4>;
++			#address-cells = <1>;
++			#size-cells = <0>;
++			status = "disabled";
++		};
++
+ 		mali: gpu@c0000 {
+ 			compatible = "amlogic,meson8b-mali", "arm,mali-450";
+ 			reg = <0xc0000 0x40000>;
+@@ -498,6 +543,32 @@
+ 			};
+ 		};
+ 
++		/*
++		 * The same BOOT bank pads as sdxc_c_pins above: BOOT_0..7 are
++		 * both nand_io and sdxc_d0/d13/d47_c, BOOT_8 is both
++		 * nand_io_ce0 and sdxc_clk_c, BOOT_10 is both nand_io_rb0 and
++		 * sdxc_cmd_c. A board may therefore enable &nfc or &sdhc, but
++		 * never both.
++		 *
++		 * nand_io_ce1 is left out because the driver hardcodes the
++		 * ready/busy interrupt to CE0, and the DQS groups because DQS
++		 * only exists in the toggle/sync modes this driver does not
++		 * drive.
++		 */
++		nand_pins: nand {
++			mux {
++				groups = "nand_io",
++					 "nand_io_ce0",
++					 "nand_io_rb0",
++					 "nand_ale",
++					 "nand_cle",
++					 "nand_wen_clk",
++					 "nand_ren_clk";
++				function = "nand";
++				bias-disable;
++			};
++		};
++
+ 		pwm_c1_pins: pwm-c1 {
+ 			mux {
+ 				groups = "pwm_c1";

@@ -395,10 +395,13 @@
  * populated with a raw NAND in the TSOP-48 position, later ones with an
  * eMMC in the BGA position -- both exist within board revision v1.1.
  *
- * Mainline Linux cannot drive the raw NAND (there is no meson8b raw-NAND
- * controller driver in tree; meson_nand.c binds only to gxl and axg). On
- * a NAND unit this controller simply finds no card and the box roots from
- * USB or SD instead, which is harmless.
+ * This file is the one both variants get by default, because on a NAND
+ * unit the controller below simply finds no card, which costs nothing.
+ * A NAND unit that wants its flash visible boots meson8b-ws1508-nand.dtb
+ * instead, which disables this node and enables the NAND controller on
+ * the same pads. That is opt-in on purpose: it yields a read-only MTD for
+ * inspection, not a bootable root, and the driver behind it has never run
+ * on this silicon. See meson8b-ws1508-nand.dts.
  */
 &sdhc {
 	status = "okay";

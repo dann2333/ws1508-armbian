@@ -1,0 +1,348 @@
+Subject: mtd: rawnand: meson: size the DMA info buffer for the worst-case sector count
+
+The NFC writes ECC status back into a second DMA buffer, the "info"
+buffer. Both places that allocate one get its size wrong.
+
+meson_chip_buffer_init() sizes it as mtd->writesize / nand->ecc.size
+entries, but that is not the sector count the controller is programmed
+with on every transfer. In short/boot-page mode meson_nfc_cmd_access()
+programs mtd->writesize / 512 sectors of 384 bytes, so on a chip using
+1K ECC steps the controller writes back twice as many info entries as
+were allocated: a 2K page in 1K steps is a 16-byte kmalloc object the
+controller DMAs 32 bytes into. That is live today on any GXL or AXG
+board whose nand@0 node carries nand-is-boot-medium.
+
+meson_nfc_read_buf() allocates PER_INFO_BYTE, which is the right count
+for a raw transfer, but does it with a kzalloc() on the identify path
+and with no room for the slack described below.
+
+Size both from the same bound Amlogic's own driver uses, which is
+derivable and does not depend on the SoC:
+
+  (pagesize / 512) * PER_INFO_BYTE + 16   drivers/amlnf/phy/chip.c
+
+The 16 bytes are not padding. In the M8 "new OOB" mode the controller
+prepends two extra 8-byte entries before the per-sector status words
+(drivers/amlnf/phy/hw_controller.c), and the vendor's allocation covers
+that even when the mode is off.
+
+For the record, because a previous version of this patch asserted it as
+fact: there is a second-hand report from a 2019 out-of-tree Meson8m2
+port that the M8 controller writes much further than this -- up to 256
+bytes -- and that Amlogic's NFC author escalated it internally without
+an answer coming back. This project has not reproduced that, has no
+citation for it, and has no Meson8-family hardware. It is also
+contradicted by Amlogic's own code, which allocates exactly the bound
+above and cache-flushes only count * PER_INFO_BYTE. So it is recorded
+here as an unverified report and is deliberately not encoded in the
+allocation. If slab corruption does turn up on M8 silicon, this is the
+first place to look, and CONFIG_SLUB_DEBUG_ON=y is what makes it
+visible.
+
+While here, correct two things that the sizing change exposes.
+
+meson_nfc_check_ecc_pages_valid() polls info_buf[nand->ecc.steps - 1]
+for ECC_COMPLETE. On a short/boot-mode transfer the last entry the
+controller writes is writesize/512 - 1, so with ecc.size = 1024 the poll
+returns as soon as the first half of the page has landed and
+meson_nfc_dma_buffer_release() then unmaps the buffer while the
+controller is still writing into it. Ask for the same sector count
+meson_nfc_cmd_access() programs.
+
+And bound that poll. It spins on `while (!ret)` with no timeout while
+holding the nand_controller lock, so a controller that never raises
+ECC_COMPLETE -- the first symptom to expect when bringing this driver up
+on a new SoC -- wedges the machine instead of returning an error
+somebody can read out of dmesg.
+
+meson_nfc_is_boot_page() also gets a guard it should always have had:
+meson_chip->boot_page_step is only read out of the device tree after
+nand_scan() returns, so it is still zero for every page nand_scan_tail()
+reads while building the in-memory bad block table, and `page % 0` is a
+division by zero on any chip whose node carries nand-is-boot-medium.
+This patch adds a second caller of that function, so the guard cannot
+wait.
+
+diff --git a/drivers/mtd/nand/raw/meson_nand.c b/drivers/mtd/nand/raw/meson_nand.c
+index fbb06aa..df783a9 100644
+--- a/drivers/mtd/nand/raw/meson_nand.c
++++ b/drivers/mtd/nand/raw/meson_nand.c
+@@ -114,6 +114,31 @@
+ 
+ #define PER_INFO_BYTE		8
+ 
++/*
++ * Smallest ECC unit the controller will ever be programmed with, and
++ * therefore the largest number of info entries a page can produce: the
++ * short/boot-page mode transfers mtd->writesize / 512 sectors regardless of
++ * nand->ecc.size (Amlogic's own driver: drivers/amlnf/phy/hw_controller.c,
++ * count = len / ecc_unit with ecc_unit = NAND_ECC_UNIT_SHORT).
++ */
++#define NFC_MIN_ECC_UNIT	512
++
++/*
++ * Amlogic's driver allocates (pagesize / 512) * PER_INFO_BYTE + 16 for this
++ * buffer (drivers/amlnf/phy/chip.c) and the 16 bytes are not padding: in the
++ * M8 "new OOB" mode the controller prepends two extra 8-byte entries before
++ * the per-sector ECC status words.  Carry the same slack so a controller in
++ * that mode cannot write past the allocation even though this driver does
++ * not (yet) know how to interpret the shifted layout.
++ */
++#define NFC_INFO_SLACK_BYTES	16
++
++/*
++ * ~10ms worth of 10-15us polls.  A page read that has not raised
++ * ECC_COMPLETE by then is not going to.
++ */
++#define ECC_COMPLETE_RETRIES	1000
++
+ #define NFC_CMD_RAW_LEN	GENMASK(13, 0)
+ 
+ #define NFC_COLUMN_ADDR_0	0
+@@ -134,6 +159,7 @@ struct meson_nfc_nand_chip {
+ 	u32 bch_mode;
+ 	u8 *data_buf;
+ 	__le64 *info_buf;
++	u32 info_buf_size;
+ 	u32 nsels;
+ 	u8 sels[] __counted_by(nsels);
+ };
+@@ -192,6 +218,9 @@ struct meson_nfc {
+ 	dma_addr_t iaddr;
+ 	u32 info_bytes;
+ 
++	void *info_scratch;
++	u32 info_scratch_size;
++
+ 	unsigned long assigned_cs;
+ 	bool no_rb_pin;
+ };
+@@ -307,11 +336,37 @@ static int meson_nfc_is_boot_page(struct nand_chip *nand, int page)
+ {
+ 	const struct meson_nfc_nand_chip *meson_chip = to_meson_nand(nand);
+ 
++	/*
++	 * boot_page_step is only read out of the device tree after nand_scan()
++	 * has returned, so it is still zero for every page nand_scan_tail()
++	 * reads while building the in-memory bad block table.  Without this
++	 * test that is a division by zero on a chip whose node carries
++	 * nand-is-boot-medium.
++	 */
+ 	return (nand->options & NAND_IS_BOOT_MEDIUM) &&
++	       meson_chip->boot_page_step &&
+ 	       !(page % meson_chip->boot_page_step) &&
+ 	       (page < meson_chip->boot_pages);
+ }
+ 
++/*
++ * How many PER_INFO_BYTE entries the controller writes back for one transfer.
++ * This is the sector count meson_nfc_cmd_access() programs into the command,
++ * which is not nand->ecc.steps in short/boot-page mode.
++ */
++static u32 meson_nfc_info_entries(struct nand_chip *nand, int raw, int page)
++{
++	struct mtd_info *mtd = nand_to_mtd(nand);
++
++	if (raw)
++		return 1;
++
++	if (meson_nfc_is_boot_page(nand, page))
++		return mtd->writesize / NFC_MIN_ECC_UNIT;
++
++	return nand->ecc.steps;
++}
++
+ static void meson_nfc_cmd_access(struct nand_chip *nand, int raw, bool dir, int page)
+ {
+ 	const struct meson_nfc_nand_chip *meson_chip = to_meson_nand(nand);
+@@ -331,7 +386,7 @@ static void meson_nfc_cmd_access(struct nand_chip *nand, int raw, bool dir, int
+ 		cmd = len | scrambler | DMA_DIR(dir);
+ 	} else if (meson_nfc_is_boot_page(nand, page)) {
+ 		pagesize = NFC_SHORT_MODE_ECC_SZ >> 3;
+-		pages = mtd->writesize / 512;
++		pages = mtd->writesize / NFC_MIN_ECC_UNIT;
+ 
+ 		scrambler = NFC_CMD_SCRAMBLER_ENABLE;
+ 		cmd = CMDRWGEN(DMA_DIR(dir), scrambler, NFC_ECC_BCH8_1K,
+@@ -644,26 +699,28 @@ static int meson_nfc_read_buf(struct nand_chip *nand, u8 *buf, int len)
+ 	struct meson_nfc *nfc = nand_get_controller_data(nand);
+ 	int ret = 0;
+ 	u32 cmd;
+-	u8 *info;
+-
+-	info = kzalloc(PER_INFO_BYTE, GFP_KERNEL);
+-	if (!info)
+-		return -ENOMEM;
+ 
+-	ret = meson_nfc_dma_buffer_setup(nand, buf, len, info,
+-					 PER_INFO_BYTE, DMA_FROM_DEVICE);
++	/*
++	 * A raw N2M transfer produces one info entry, but this used to hand the
++	 * controller an 8-byte kzalloc() -- an allocation on the identify path
++	 * with no room for the slack the info layout can need.  The
++	 * controller-wide scratch buffer is allocated once, is kmalloc-backed
++	 * and therefore DMA-safe, and is shared safely because every caller
++	 * that reaches here holds the nand_controller lock.
++	 */
++	ret = meson_nfc_dma_buffer_setup(nand, buf, len, nfc->info_scratch,
++					 nfc->info_scratch_size,
++					 DMA_FROM_DEVICE);
+ 	if (ret)
+-		goto out;
++		return ret;
+ 
+ 	cmd = NFC_CMD_N2M | len;
+ 	writel(cmd, nfc->reg_base + NFC_REG_CMD);
+ 
+ 	meson_nfc_drain_cmd(nfc);
+ 	meson_nfc_wait_cmd_finish(nfc, 1000);
+-	meson_nfc_dma_buffer_release(nand, len, PER_INFO_BYTE, DMA_FROM_DEVICE);
+-
+-out:
+-	kfree(info);
++	meson_nfc_dma_buffer_release(nand, len, nfc->info_scratch_size,
++				     DMA_FROM_DEVICE);
+ 
+ 	return ret;
+ }
+@@ -757,7 +814,7 @@ static int meson_nfc_write_page_sub(struct nand_chip *nand,
+ 	meson_nfc_select_chip(nand, nand->cur_cs);
+ 
+ 	data_len =  mtd->writesize + mtd->oobsize;
+-	info_len = nand->ecc.steps * PER_INFO_BYTE;
++	info_len = meson_chip->info_buf_size;
+ 
+ 	ret = meson_nfc_rw_cmd_prepare_and_execute(nand, page, DIRWRITE);
+ 	if (ret)
+@@ -798,30 +855,52 @@ static int meson_nfc_write_page_hwecc(struct nand_chip *nand,
+ 	u8 *oob_buf = nand->oob_poi;
+ 
+ 	memcpy(meson_chip->data_buf, buf, mtd->writesize);
+-	memset(meson_chip->info_buf, 0, nand->ecc.steps * PER_INFO_BYTE);
++	memset(meson_chip->info_buf, 0, meson_chip->info_buf_size);
+ 	meson_nfc_set_user_byte(nand, oob_buf);
+ 
+ 	return meson_nfc_write_page_sub(nand, page, 0);
+ }
+ 
+-static void meson_nfc_check_ecc_pages_valid(struct meson_nfc *nfc,
+-					    struct nand_chip *nand, int raw)
++static int meson_nfc_check_ecc_pages_valid(struct meson_nfc *nfc,
++					   struct nand_chip *nand, int raw,
++					   int page)
+ {
+ 	struct meson_nfc_nand_chip *meson_chip = to_meson_nand(nand);
+ 	__le64 *info;
+ 	u32 neccpages;
+-	int ret;
++	int retries;
+ 
+-	neccpages = raw ? 1 : nand->ecc.steps;
++	/*
++	 * The last entry the controller will write, which is not
++	 * nand->ecc.steps - 1 on a short/boot-mode transfer: there the
++	 * controller is programmed with mtd->writesize / 512 sectors of 384
++	 * bytes.  Watching the wrong entry either never completes or -- worse
++	 * -- declares the transfer done while later sectors are still being
++	 * DMAed into a buffer the caller is about to unmap.
++	 */
++	neccpages = meson_nfc_info_entries(nand, raw, page);
+ 	info = &meson_chip->info_buf[neccpages - 1];
+-	do {
++
++	/*
++	 * Bounded rather than a bare while (!ret): a controller that never
++	 * raises ECC_COMPLETE is the first symptom to expect when bringing this
++	 * driver up on a new SoC, and spinning forever here does it while
++	 * holding the controller lock, so the machine wedges with no way to get
++	 * the diagnosis off it.
++	 */
++	for (retries = ECC_COMPLETE_RETRIES; retries > 0; retries--) {
+ 		usleep_range(10, 15);
+ 		/* info is updated by nfc dma engine*/
+ 		smp_rmb();
+ 		dma_sync_single_for_cpu(nfc->dev, nfc->iaddr, nfc->info_bytes,
+ 					DMA_FROM_DEVICE);
+-		ret = *info & ECC_COMPLETE;
+-	} while (!ret);
++		if (*info & ECC_COMPLETE)
++			return 0;
++	}
++
++	dev_err(nfc->dev, "ECC completion timed out on page %d\n", page);
++
++	return -ETIMEDOUT;
+ }
+ 
+ static int meson_nfc_read_page_sub(struct nand_chip *nand,
+@@ -836,7 +915,7 @@ static int meson_nfc_read_page_sub(struct nand_chip *nand,
+ 	meson_nfc_select_chip(nand, nand->cur_cs);
+ 
+ 	data_len =  mtd->writesize + mtd->oobsize;
+-	info_len = nand->ecc.steps * PER_INFO_BYTE;
++	info_len = meson_chip->info_buf_size;
+ 
+ 	ret = meson_nfc_rw_cmd_prepare_and_execute(nand, page, DIRREAD);
+ 	if (ret)
+@@ -851,7 +930,8 @@ static int meson_nfc_read_page_sub(struct nand_chip *nand,
+ 	meson_nfc_cmd_access(nand, raw, DIRREAD, page);
+ 
+ 	ret = meson_nfc_wait_dma_finish(nfc);
+-	meson_nfc_check_ecc_pages_valid(nfc, nand, raw);
++	if (!ret)
++		ret = meson_nfc_check_ecc_pages_valid(nfc, nand, raw, page);
+ 
+ 	meson_nfc_dma_buffer_release(nand, data_len, info_len, DMA_FROM_DEVICE);
+ 
+@@ -1225,10 +1305,22 @@ static int meson_chip_buffer_init(struct nand_chip *nand)
+ 	struct meson_nfc_nand_chip *meson_chip = to_meson_nand(nand);
+ 	u32 page_bytes, info_bytes, nsectors;
+ 
+-	nsectors = mtd->writesize / nand->ecc.size;
++	/*
++	 * Size for the largest sector count any transfer can ask for, not just
++	 * for nand->ecc.steps: a short/boot-page read is programmed with
++	 * mtd->writesize / 512 sectors, so on a chip using 1K ECC steps it
++	 * produces twice as many info entries as nand->ecc.steps.  With the old
++	 * nsectors * PER_INFO_BYTE this buffer was a 16-byte kmalloc object that
++	 * the controller wrote 32 bytes into on every boot-page read.
++	 *
++	 * This matches what Amlogic's own driver allocates:
++	 * (pagesize / 512) * PER_INFO_BYTE + 16 (drivers/amlnf/phy/chip.c).
++	 */
++	nsectors = max(mtd->writesize / nand->ecc.size,
++		       mtd->writesize / NFC_MIN_ECC_UNIT);
+ 
+ 	page_bytes =  mtd->writesize + mtd->oobsize;
+-	info_bytes = nsectors * PER_INFO_BYTE;
++	info_bytes = nsectors * PER_INFO_BYTE + NFC_INFO_SLACK_BYTES;
+ 
+ 	meson_chip->data_buf = kmalloc(page_bytes, GFP_KERNEL);
+ 	if (!meson_chip->data_buf)
+@@ -1240,6 +1332,8 @@ static int meson_chip_buffer_init(struct nand_chip *nand)
+ 		return -ENOMEM;
+ 	}
+ 
++	meson_chip->info_buf_size = info_bytes;
++
+ 	return 0;
+ }
+ 
+@@ -1564,6 +1658,17 @@ static int meson_nfc_probe(struct platform_device *pdev)
+ 
+ 	nfc->dev = dev;
+ 
++	/*
++	 * One info entry plus the same slack meson_chip_buffer_init() carries.
++	 * devm_kzalloc() is kmalloc-backed, so this is safe to hand to
++	 * dma_map_single().
++	 */
++	nfc->info_scratch_size = PER_INFO_BYTE + NFC_INFO_SLACK_BYTES;
++	nfc->info_scratch = devm_kzalloc(dev, nfc->info_scratch_size,
++					 GFP_KERNEL);
++	if (!nfc->info_scratch)
++		return -ENOMEM;
++
+ 	nfc->reg_base = devm_platform_ioremap_resource_byname(pdev, "nfc");
+ 	if (IS_ERR(nfc->reg_base))
+ 		return PTR_ERR(nfc->reg_base);

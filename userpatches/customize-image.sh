@@ -46,7 +46,19 @@ EXTRA_PACKAGES="${WS1508_EXTRA_PACKAGES:-}"
 # Needed by /usr/local/sbin/ws1508-install-to-emmc. BUILD_MINIMAL images do
 # not carry rsync or dosfstools, and discovering that only when the user
 # tries to install to eMMC would be a poor joke.
-REQUIRED_PACKAGES="rsync dosfstools e2fsprogs util-linux parted"
+#
+# mtd-utils is for ws1508-nand-probe on raw-NAND units, which uses only
+# nanddump. Be clear about what else lands with it: Debian/Ubuntu ship one
+# combined mtd-utils, so the image also gets flash_erase, nandwrite,
+# nandtest and ubiformat/ubiattach. Nothing here calls them, and leaving
+# CONFIG_MTD_UBI off does not disarm them (ubiformat erases through
+# /dev/mtdN with plain MEMERASE/MEMWRITE ioctls). So on a NAND unit the
+# only thing between those tools and the vendor bootloader region is the
+# kernel-side guard in ws1508-0102-*.patch plus the read-only default --
+# not the absence of tooling. Anyone reading a claim to the contrary
+# elsewhere in the tree should trust this line, and check `dpkg -L
+# mtd-utils` on a built image.
+REQUIRED_PACKAGES="rsync dosfstools e2fsprogs util-linux parted mtd-utils"
 
 say() { printf '\n\033[1;36m[ws1508]\033[0m %s\n' "$*"; }
 
@@ -326,8 +338,55 @@ install_helper() {
 		else
 		    echo "type:    no eMMC detected - this is most likely a raw-NAND unit"
 		    echo
-		    echo "Mainline Linux has no driver for the S805's raw NAND"
-		    echo "controller, so the root filesystem must stay on USB or SD."
+		    if [ -e /sys/class/mtd/mtd0 ]; then
+		        mtdsize=$(cat /sys/class/mtd/mtd0/size 2>/dev/null || echo 0)
+		        mtdflags=$(cat /sys/class/mtd/mtd0/flags 2>/dev/null || echo 0)
+		        echo "mtd0:    $((mtdsize / 1024 / 1024)) MB, erase block $(cat /sys/class/mtd/mtd0/erasesize) B, page $(cat /sys/class/mtd/mtd0/writesize) B"
+		        # 0x400 is MTD_WRITEABLE; the driver clears it by default
+		        if [ $((mtdflags & 0x400)) -eq 0 ]; then
+		            echo "access:  READ-ONLY (the driver's default)"
+		        else
+		            echo "access:  writable - meson_nand.allow_write=1 is set"
+		        fi
+		        echo
+		        echo "The raw-NAND driver is bound and enumerated the chip."
+		        echo "Whether it is reading it CORRECTLY is a separate"
+		        echo "question: this driver has never run on meson8b"
+		        echo "silicon, and until the ECC strength and scrambler"
+		        echo "settings are confirmed to match the vendor, reads of"
+		        echo "vendor-written pages may come back uncorrectable."
+		        echo
+		        echo "It still cannot be booted from. Not because u-boot"
+		        echo "cannot read NAND -- it can, with 'store read' /"
+		        echo "'amlnf read', which is how vendor firmware boots --"
+		        echo "but because it has no filesystem layer over NAND and"
+		        echo "this project implements no store-read boot path and no"
+		        echo "rootfs for the vendor NFTL. Unimplemented, not"
+		        echo "impossible. Kernel, initrd and dtb come off USB or SD."
+		        echo
+		        echo "Run 'ws1508-nand-probe' to inspect or dump it."
+		    else
+		        echo "There is no /dev/mtd0. Two possible reasons:"
+		        echo
+		        echo "  1. the running device tree leaves the NAND"
+		        echo "     controller disabled - the default, and the"
+		        echo "     likely one. To turn it on, add this to"
+		        echo "     /boot/armbianEnv.txt and reboot:"
+		        echo
+		        echo "         fdtfile=meson8b-ws1508-nand.dtb"
+		        echo
+		        echo "  2. it is enabled and nand_scan() did not manage to"
+		        echo "     enumerate the fitted die. That is a real"
+		        echo "     possibility: this driver has never run on"
+		        echo "     meson8b silicon. Check dmesg for meson-nand."
+		        echo
+		        echo "Read the notes beside that fdtfile line first: it is"
+		        echo "experimental and unvalidated, it gives a READ-ONLY"
+		        echo "mtd if it works at all, and it does NOT let the box"
+		        echo "boot from internal storage."
+		    fi
+		    echo
+		    echo "The root filesystem stays on USB or SD on this variant."
 		    echo "Flash ws1508-uboot.burn.img (bootloader only) and boot the"
 		    echo "system from a USB stick."
 		fi
@@ -348,6 +407,14 @@ install_helper() {
 	if [ -r /tmp/overlay/ws1508-install-to-emmc ]; then
 		install -m 0755 /tmp/overlay/ws1508-install-to-emmc \
 			/usr/local/sbin/ws1508-install-to-emmc
+	fi
+
+	# Read-only diagnostics for the raw-NAND variant. Harmless to ship on
+	# an eMMC unit: it exits early when the running device tree is not the
+	# NAND one.
+	if [ -r /tmp/overlay/ws1508-nand-probe ]; then
+		install -m 0755 /tmp/overlay/ws1508-nand-probe \
+			/usr/local/sbin/ws1508-nand-probe
 	fi
 
 	# Show the essentials, including the default-password warning, on login.

@@ -1,0 +1,393 @@
+Subject: mtd: rawnand: meson: write-protect the vendor boot region
+
+Kept as its own patch so that it is visible in review and cannot be
+dropped by accident along with a rebase.
+
+The first thing this driver will meet on a real Meson8b board is a chip
+the Amlogic bootloader wrote and still depends on, on a board whose only
+recovery path is the USB Burning Tool -- which restores firmware but not
+the per-device key blobs that live in that region. So there are two
+gates, and they are deliberately not the same gate.
+
+meson_nand.allow_write (default 0) clears MTD_WRITEABLE on the master
+for any SoC marked experimental. Partitions copy the master's flags, so
+mtdchar writes, MEMERASE and UBI all get -EROFS through every path, and
+the module parameter is the single place a user says "I accept this".
+
+The address guard is not overridable. write_protect_end is derived at
+attach time from the geometry the chip reports, using the vendor
+driver's own units -- BOOT_COPY_NUM (4) x BOOT_PAGES_PER_COPY (256)
+pages of u-boot copies plus RESERVED_BLOCK_CNT (48) blocks of BBT, key
+and config data, all from drivers/amlnf/include/phynand.h, with slack
+because that reserved window is counted in *good* blocks and therefore
+slides upward with the factory bad blocks. Deriving it rather than
+hardcoding a byte offset is what keeps it correct on a part nobody has
+identified yet -- but a derived window also shrinks by exactly the
+factor by which nand_scan() under-reports the geometry, and
+mis-detection is the most likely failure mode on an unidentified die
+driven by an unvalidated port. So the result is clamped to a 16MiB
+floor, which is comfortably past 4 x 256 boot pages on any plausible
+geometry.
+
+Getting the guard onto every path that can modify the chip takes five
+hooks, not one, because mtd->_erase is not the only way in:
+
+  meson_nfc_exec_op()        refuses NAND_CMD_ERASE1 and NAND_CMD_SEQIN
+                             whose row address
+                             falls inside the region. This is the
+                             innermost gate and the only one nand_base
+                             cannot walk around:
+                             nand_block_markbad_lowlevel() calls
+                             nand_erase_nand() DIRECTLY rather than
+                             through mtd->_erase, so with only an
+                             ->_erase wrapper a MEMSETBADBLOCK ioctl on
+                             block 0 erases the bootloader -- which is
+                             exactly what "nandtest --markbad" issues
+                             after an erase is refused. ERASE1 reaches
+                             the chip only from nand_erase_op(), which
+                             always emits it as a CMD followed by a
+                             row-address-only ADDR, so the block is
+                             recoverable here exactly.
+
+  mtd->_block_markbad        refuses before nand_block_markbad_lowlevel()
+                             is entered at all, so the caller gets
+                             -EROFS instead of a silently ineffective
+                             mark.
+
+  ecc.write_oob{,_raw}       nand_do_write_oob() dispatches straight to
+                             these, so neither the page-program guard
+                             below nor anything on mtd->_write_oob sees
+                             an OOB-only program. Both the MEMWRITEOOB
+                             ioctl and nand_default_block_markbad() get
+                             there, and the bytes they would rewrite
+                             inside a boot page are covered by the ECC
+                             the ROM checks.
+
+  meson_nfc_write_page_sub() refuses hwecc and raw page programs.
+
+  mtd->_erase                refuses erases arriving the normal way, so
+                             the error comes back from the ioctl rather
+                             than from an op two layers down.
+
+Upstream's secure-regions mechanism was considered and rejected. A
+`secure-regions = <0x0 0x...>` property on the nand@0 node is enforced
+inside nand_erase_nand(), nand_do_write_oob(), nand_do_write_ops() and
+nand_isbad_bbm(), so it would cover the erase path that motivated all of
+this, in fewer lines and without touching the driver. But it also gates
+the READ paths (nand_do_read_ops() and nand_do_read_oob() both return
+-EIO for a secured region), and reading that region is the entire point
+of this port: dumping the vendor pages and comparing them against a dump
+taken with the vendor bootloader is the only way to find out whether the
+ECC and scrambler settings are right. It would also break probe outright
+-- create_bbt() propagates the -EIO out of scan_block_fast(), so
+nand_scan() fails before an mtd device is ever registered. And being a
+DT property it protects only boards that remember to write it, whereas
+this is a property of the SoC family. Read-only-plus-address-guard keeps
+the region readable and protects every meson8/8b board whether or not
+its author knew to ask.
+
+Both the MTD_WRITEABLE clear and the mtd op wrappers have to be
+installed after nand_scan() returns: nand_scan_tail() runs after
+->attach_chip() and assigns mtd->_erase, mtd->_block_markbad and, via
+nanddev_init(), mtd->flags outright.
+
+What this does NOT protect against: an on-flash bad block table.
+nand_bbt.c calls nand_erase_nand() directly too, from write_bbt(). That
+path is only reachable with nand-on-flash-bbt, and it places the table
+in blocks at the end of the chip rather than at the start, so it does
+not overlap this region -- but it is not gated here either.
+
+diff --git a/drivers/mtd/nand/raw/meson_nand.c b/drivers/mtd/nand/raw/meson_nand.c
+--- a/drivers/mtd/nand/raw/meson_nand.c
++++ b/drivers/mtd/nand/raw/meson_nand.c
+@@ -145,6 +145,35 @@
+ #define NFC_COLUMN_ADDR_1	0
+ 
+ /*
++ * Extent of the region the Amlogic bootloader owns, in the vendor driver's own
++ * units: BOOT_COPY_NUM (4) x BOOT_PAGES_PER_COPY (256) pages of u-boot copies,
++ * then RESERVED_BLOCK_CNT (48) blocks of BBT, key and config data, all from
++ * drivers/amlnf/include/phynand.h.  The reserved window is counted in *good*
++ * blocks, so it slides further up the chip the more factory bad blocks fall
++ * inside it -- hence the slack.  Expressed in pages and blocks rather than
++ * bytes because the fitted part is not identified on the board this was
++ * written for, so it has to be derived from the geometry the chip reports.
++ */
++#define MESON8_VENDOR_BOOT_PAGES		1024
++#define MESON8_VENDOR_RESERVED_BLOCKS	64
++
++/*
++ * ...but only as a lower bound on the region, never as the whole answer.  A
++ * geometry-derived window shrinks by exactly the factor by which nand_scan()
++ * under-reports the page or erase size, and mis-detection is the single most
++ * likely failure mode on an unidentified die driven by an unvalidated port.
++ * 16MiB is what this platform already reserves ahead of the first partition on
++ * its eMMC variant, and it is comfortably past the 4 x 256 boot pages on any
++ * plausible geometry.
++ */
++#define MESON8_VENDOR_MIN_BYTES		(16 * 1024 * 1024)
++
++static bool meson_nfc_allow_write;
++module_param_named(allow_write, meson_nfc_allow_write, bool, 0444);
++MODULE_PARM_DESC(allow_write,
++		 "Permit erase and program on SoCs whose NAND port is unvalidated (default: the MTD is read-only)");
++
++/*
+  * Off by default on every SoC that sets .soft_waitrdy.  No Amlogic code has
+  * ever enabled the NFC ready/busy interrupt on the M8 family, and no meson8b
+  * device tree carries an interrupt for this controller, so the polling path is
+@@ -172,6 +201,11 @@
+ 	u8 *data_buf;
+ 	__le64 *info_buf;
+ 	u32 info_buf_size;
++	loff_t write_protect_end;
++	int (*orig_erase)(struct mtd_info *mtd, struct erase_info *instr);
++	int (*orig_write_oob)(struct nand_chip *chip, int page);
++	int (*orig_write_oob_raw)(struct nand_chip *chip, int page);
++	int (*orig_block_markbad)(struct mtd_info *mtd, loff_t ofs);
+ 	u32 nsels;
+ 	u8 sels[] __counted_by(nsels);
+ };
+@@ -321,6 +355,20 @@
+ 	return container_of(nand, struct meson_nfc_nand_chip, nand);
+ }
+ 
++/*
++ * True when @page lies inside the region the boot ROM and the vendor
++ * bootloader own.  Zero write_protect_end means the guard is not armed at all,
++ * which is the case on every SoC not marked .experimental.
++ */
++static bool meson_nfc_page_is_protected(struct nand_chip *nand, int page)
++{
++	struct meson_nfc_nand_chip *meson_chip = to_meson_nand(nand);
++	struct mtd_info *mtd = nand_to_mtd(nand);
++
++	return meson_chip->write_protect_end &&
++	       (loff_t)page * mtd->writesize < meson_chip->write_protect_end;
++}
++
+ static void meson_nfc_select_chip(struct nand_chip *nand, int chip)
+ {
+ 	struct meson_nfc_nand_chip *meson_chip = to_meson_nand(nand);
+@@ -870,6 +918,13 @@
+ 	u32 cmd;
+ 	int ret;
+ 
++	if (meson_nfc_page_is_protected(nand, page)) {
++		dev_err(nfc->dev,
++			"refusing to program page %d: the vendor bootloader region ends at 0x%llx\n",
++			page, meson_chip->write_protect_end);
++		return -EROFS;
++	}
++
+ 	meson_nfc_select_chip(nand, nand->cur_cs);
+ 
+ 	data_len =  mtd->writesize + mtd->oobsize;
+@@ -1181,6 +1236,56 @@
+ 	if (check_only)
+ 		return 0;
+ 
++	/*
++	 * The innermost gate.  mtd->_erase is not the single entry to an erase:
++	 * nand_block_markbad_lowlevel() calls nand_erase_nand() directly, so a
++	 * MEMSETBADBLOCK ioctl on block 0 would erase the bootloader with every
++	 * mtd-level wrapper still in place.  Both destructive primitives reach
++	 * the chip as an op carrying deassert_wp, and both encode the target row
++	 * the same way, so decoding it here catches whatever nand_base grows a
++	 * new caller for: nand_erase_op() emits ERASE1 with a row-only address,
++	 * and nand_exec_prog_page_op() emits SEQIN with the two column cycles of
++	 * nand_fill_column_cycles() ahead of the row.
++	 */
++	if (meson_chip->write_protect_end && op->deassert_wp) {
++		for (op_id = 0; op_id + 1 < op->ninstrs; op_id++) {
++			const struct nand_op_instr *addr = &op->instrs[op_id + 1];
++			unsigned int page = 0;
++			int skip;
++
++			instr = &op->instrs[op_id];
++			if (instr->type != NAND_OP_CMD_INSTR ||
++			    addr->type != NAND_OP_ADDR_INSTR)
++				continue;
++
++			switch (instr->ctx.cmd.opcode) {
++			case NAND_CMD_ERASE1:
++				skip = 0;
++				break;
++			case NAND_CMD_SEQIN:
++				skip = 2;
++				break;
++			default:
++				continue;
++			}
++
++			/* A row address is two or three cycles wide. */
++			if (addr->ctx.addr.naddrs < skip + 2 ||
++			    addr->ctx.addr.naddrs > skip + 3)
++				continue;
++
++			for (i = addr->ctx.addr.naddrs - 1; i >= skip; i--)
++				page = (page << 8) | addr->ctx.addr.addrs[i];
++
++			if (meson_nfc_page_is_protected(nand, page)) {
++				dev_err(nfc->dev,
++					"refusing to modify the block holding page %u: the vendor bootloader region ends at 0x%llx\n",
++					page, meson_chip->write_protect_end);
++				return -EROFS;
++			}
++		}
++	}
++
+ 	meson_nfc_select_chip(nand, op->cs);
+ 	for (op_id = 0; op_id < op->ninstrs; op_id++) {
+ 		instr = &op->instrs[op_id];
+@@ -1542,6 +1647,36 @@
+ 	meson_nfc_free_buffer(nand);
+ }
+ 
++static int meson_nfc_write_oob_guard(struct nand_chip *nand, int page)
++{
++	struct meson_nfc_nand_chip *meson_chip = to_meson_nand(nand);
++	struct meson_nfc *nfc = nand_get_controller_data(nand);
++
++	if (meson_nfc_page_is_protected(nand, page)) {
++		dev_err(nfc->dev,
++			"refusing to write the OOB of page %d: the vendor bootloader region ends at 0x%llx\n",
++			page, meson_chip->write_protect_end);
++		return -EROFS;
++	}
++
++	return meson_chip->orig_write_oob(nand, page);
++}
++
++static int meson_nfc_write_oob_raw_guard(struct nand_chip *nand, int page)
++{
++	struct meson_nfc_nand_chip *meson_chip = to_meson_nand(nand);
++	struct meson_nfc *nfc = nand_get_controller_data(nand);
++
++	if (meson_nfc_page_is_protected(nand, page)) {
++		dev_err(nfc->dev,
++			"refusing to write the OOB of page %d: the vendor bootloader region ends at 0x%llx\n",
++			page, meson_chip->write_protect_end);
++		return -EROFS;
++	}
++
++	return meson_chip->orig_write_oob_raw(nand, page);
++}
++
+ static int meson_nand_attach_chip(struct nand_chip *nand)
+ {
+ 	struct meson_nfc *nfc = nand_get_controller_data(nand);
+@@ -1590,6 +1725,17 @@
+ 		return -EOPNOTSUPP;
+ 	}
+ 
++	/*
++	 * Arm the address guard as early as possible: everything installed
++	 * below keys off write_protect_end being non-zero.
++	 */
++	if (nfc->data->experimental)
++		meson_chip->write_protect_end =
++			max_t(loff_t,
++			      (loff_t)MESON8_VENDOR_BOOT_PAGES * mtd->writesize +
++			      (loff_t)MESON8_VENDOR_RESERVED_BLOCKS * mtd->erasesize,
++			      MESON8_VENDOR_MIN_BYTES);
++
+ 	if (nand->bbt_options & NAND_BBT_USE_FLASH)
+ 		nand->bbt_options |= NAND_BBT_NO_OOB;
+ 
+@@ -1624,6 +1770,20 @@
+ 	nand->ecc.write_oob_raw = nand_write_oob_std;
+ 	nand->ecc.write_oob = nand_write_oob_std;
+ 
++	/*
++	 * nand_do_write_oob() dispatches straight to ecc.write_oob{,_raw}, so
++	 * neither meson_nfc_write_page_sub() nor anything installed on
++	 * mtd->_write_oob sees an OOB-only program.  Both the MEMWRITEOOB ioctl
++	 * and nand_default_block_markbad() get here, and the bytes they would
++	 * rewrite inside a boot page are covered by the ECC the ROM checks.
++	 */
++	if (meson_chip->write_protect_end) {
++		meson_chip->orig_write_oob = nand->ecc.write_oob;
++		meson_chip->orig_write_oob_raw = nand->ecc.write_oob_raw;
++		nand->ecc.write_oob = meson_nfc_write_oob_guard;
++		nand->ecc.write_oob_raw = meson_nfc_write_oob_raw_guard;
++	}
++
+ 	nand->ecc.read_page_raw = meson_nfc_read_page_raw;
+ 	nand->ecc.read_page = meson_nfc_read_page_hwecc;
+ 	nand->ecc.read_oob_raw = meson_nfc_read_oob_raw;
+@@ -1652,6 +1812,42 @@
+ 	return ret;
+ }
+ 
++static int meson_nfc_erase_guard(struct mtd_info *mtd, struct erase_info *instr)
++{
++	struct meson_nfc_nand_chip *meson_chip = to_meson_nand(mtd_to_nand(mtd));
++
++	if (instr->addr < meson_chip->write_protect_end) {
++		dev_err(&mtd->dev,
++			"refusing to erase 0x%llx: the vendor bootloader region ends at 0x%llx\n",
++			instr->addr, meson_chip->write_protect_end);
++		return -EROFS;
++	}
++
++	return meson_chip->orig_erase(mtd, instr);
++}
++
++/*
++ * mtd_block_markbad() is a write path in disguise, and the most dangerous one
++ * here: nand_block_markbad_lowlevel() ERASES the block first, and it calls
++ * nand_erase_nand() directly rather than through mtd->_erase, so the erase
++ * wrapper above never sees it.  "nandtest --markbad" issues exactly this after
++ * an erase is refused, which without this wrapper turns a refused erase of
++ * block 0 into a completed one.
++ */
++static int meson_nfc_block_markbad_guard(struct mtd_info *mtd, loff_t ofs)
++{
++	struct meson_nfc_nand_chip *meson_chip = to_meson_nand(mtd_to_nand(mtd));
++
++	if (ofs < meson_chip->write_protect_end) {
++		dev_err(&mtd->dev,
++			"refusing to mark 0x%llx bad: that would erase it, and the vendor bootloader region ends at 0x%llx\n",
++			ofs, meson_chip->write_protect_end);
++		return -EROFS;
++	}
++
++	return meson_chip->orig_block_markbad(mtd, ofs);
++}
++
+ static const struct nand_controller_ops meson_nand_controller_ops = {
+ 	.attach_chip = meson_nand_attach_chip,
+ 	.detach_chip = meson_nand_detach_chip,
+@@ -1721,6 +1917,31 @@
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * These have to happen here rather than in ->attach_chip():
++	 * nand_scan_tail() runs after attach and assigns mtd->_erase,
++	 * mtd->_block_markbad and, via nanddev_init(), mtd->flags outright, so
++	 * anything set earlier is simply overwritten.
++	 */
++	if (meson_chip->write_protect_end) {
++		meson_chip->orig_erase = mtd->_erase;
++		mtd->_erase = meson_nfc_erase_guard;
++		meson_chip->orig_block_markbad = mtd->_block_markbad;
++		mtd->_block_markbad = meson_nfc_block_markbad_guard;
++
++		if (!meson_nfc_allow_write) {
++			/* partitions inherit this, so it covers them too */
++			mtd->flags &= ~MTD_WRITEABLE;
++			dev_warn(dev,
++				 "%s: read-only, this SoC's NAND port has never been validated on real silicon; boot with meson_nand.allow_write=1 to override\n",
++				 mtd->name);
++		}
++
++		dev_info(dev,
++			 "%s: erase, program, OOB write and mark-bad are refused below 0x%llx whatever meson_nand.allow_write says\n",
++			 mtd->name, meson_chip->write_protect_end);
++	}
++
+ 	if (nand->options & NAND_IS_BOOT_MEDIUM) {
+ 		ret = of_property_read_u32(np, "amlogic,boot-pages",
+ 					   &meson_chip->boot_pages);
