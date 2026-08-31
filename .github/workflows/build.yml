@@ -245,17 +245,39 @@ jobs:
 
           ### 下载哪个文件？
 
-          先确认你的机器是 **eMMC 版**还是 **NAND 版**（拆机看闪存芯片，或参考
-          `docs/hardware.md`）：
+          **不确定就照这两个来。** 两种机器都适用，也不动内置存储里的数据：
 
-          | 你的机器 | 下载 | 结果 |
+          1. `ws1508-uboot.burn.img` — 用 USB Burning Tool 刷入，换掉原厂引导
+          2. `Armbian-*.img.xz` — 解压后写入 U 盘
+
+          开机后跑 `ws1508-info`，它会报出机器是 eMMC 版还是 NAND 版，再决定
+          要不要把系统装进内置存储。
+
+          | 文件 | 给谁 | 说明 |
           |---|---|---|
-          | eMMC 版 | `*.burn.img` | 直刷内置存储，拔掉 U 盘也能开机 |
-          | NAND 版 | `ws1508-uboot.burn.img` | 只刷引导，系统跑在 U 盘上 |
-          | 想先试试不动内置存储 | `*.img.xz` | 写入 U 盘/SD 卡启动 |
+          | `ws1508-uboot.burn.img` | 所有人 | 1.4MB，只换引导 |
+          | `Armbian-*.img.xz` | 所有人 | 写 U 盘/SD 卡启动 |
+          | `Armbian-*.burn.img` | **仅 eMMC 版** | 引导 + 系统一次刷进 eMMC |
+          | `ws1508-nand.burn.img` | **仅 NAND 版** | 引导 + NAND 内核。根文件系统还要进系统跑 `ws1508-install-to-nand` |
+          | `ws1508-nand-boot.andr` | 仅 NAND 版 | 上一个包里的裸 Android boot.img，只有手动敲 u-boot 命令时才用得上 |
 
-          两种 `.burn.img` 都用 **Amlogic USB Burning Tool** 刷入。
-          详细步骤见 `docs/flashing.md`。
+          `.burn.img` 都用 **Amlogic USB Burning Tool** 刷入。详细步骤见
+          `docs/flashing.md`。
+
+          ⚠️ **别把 `Armbian-*.burn.img` 刷进 NAND 版。** 它的 `boot` 是 FAT
+          分区镜像，会盖掉 NAND 内核；`rootfs` 落在 UBI 占的物理区域上，Linux
+          再也读不回来。
+
+          ⚠️ **NAND 版刷本项目的引导必须勾「擦除 flash」**，`ws1508-uboot.burn.img`
+          也一样。本项目改了 NAND 分区表，不勾擦除时烧录工具用
+          `store init 1` 初始化存储，分区表对不上会直接失败，整个刷机过程根本
+          起不来。代价是一机一份的 `nkey`/`nsec` 永久丢失、无法恢复。
+          eMMC 版不受这条影响。**分不清自己是哪个版本就先不勾直接刷**：刷成功
+          说明是 eMMC 版；卡在初始化存储那一步失败，说明是 NAND 版，勾上擦除
+          再刷一次。详见 `docs/flashing.md`。
+
+          ⚠️ NAND 版装内置系统（`ws1508-nand.burn.img` + `ws1508-install-to-nand`）
+          **从未在实机上验证过**。先刷引导 + U 盘把机器跑起来，确认正常再考虑。
 
           ### 默认登录
 

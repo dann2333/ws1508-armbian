@@ -87,9 +87,23 @@
  * and nfdata from 3 to 1, with no name or size touched. So "nothing was
  * renamed or resized" is NOT a reason to skip it -- the FIRST flash of
  * this bootloader onto any NAND unit MUST be done with the USB Burning
- * Tool's "erase flash" ticked. That erase also destroys the per-unit nkey/nsec
- * records, which nothing in this project can restore -- see
- * docs/flashing.md.
+ * Tool's "erase flash" ticked.
+ *
+ * Without the tick the burn does not even start: the tool sends
+ * "disk_initial 0", optimus_storage_init() maps that to store_init(1)
+ * (optimus_download.c:750), do_store skips its erase pass and runs
+ * "amlnf init 1" (store_interface.c:684-693), and the confirm rejects it --
+ * the tolerance at chipenv.c:2859 covers flags 2 and 3 only. disk_initial
+ * fails and no partition is written. With the tick it is store_init(3):
+ * "amlnf init 3" erases the config block first, then "amlnf init 1" finds
+ * arg_valid == 0 and saves the new table.
+ *
+ * That erase also destroys the per-unit nkey/nsec records, which nothing in
+ * this project can restore. chipenv_init_erase_protect() does have a branch
+ * that would spare those blocks, but it tests nand_key.valid_blk_addr, and
+ * every write to that field sits under CONFIG_SECURITYKEY, which this board
+ * config leaves off -- so the field stays 0, the ">= start_blk" guard is
+ * false, and nothing is protected. See docs/flashing.md.
  *
  * store_device_flag is only the compiled-in default. At runtime
  * get_device_boot_flag() in arch/arm/lib/board.c re-detects the actual

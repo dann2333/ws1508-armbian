@@ -55,6 +55,12 @@
 | **NAND 版** | `ws1508-uboot.burn.img` | Amlogic USB Burning Tool | ⚠️ 只刷引导，系统在 U 盘上 |
 | **先试试看** | `Armbian_*_ws1508_*.img.xz` | 解压后写入 U 盘 / SD 卡 | 不动内置存储 |
 
+> 🔴 **NAND 版第一次刷本项目的引导，必须在烧录工具里勾上「擦除 flash」**
+> —— `ws1508-uboot.burn.img` 也一样。本项目改了 NAND 分区表，不勾擦除时
+> 烧录工具用 `store init 1` 初始化存储，分区表对不上会直接失败，一个分区
+> 都写不进去。代价是一机一份的 `nkey`/`nsec` 永久丢失、本项目无法恢复。
+> 详见 [`docs/flashing.md`](docs/flashing.md)。eMMC 版不受这条影响。
+
 完整步骤（含进入刷机模式、救砖）见 [`docs/flashing.md`](docs/flashing.md)。
 
 eMMC 版还有一条**更稳妥的备选路线**：只刷 `ws1508-uboot.burn.img`，
