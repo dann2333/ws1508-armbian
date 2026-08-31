@@ -31,8 +31,15 @@
 # The reason mtd1 is safe to write is specific and worth knowing: it falls
 # inside amlnf's "nfdata" device, and the NFTL blob's amlnf_logic_init()
 # skips nfdata when u-boot calls it with flag 0 -- which is what every
-# normal boot does. So no garbage collection or wear levelling from the
-# vendor side ever runs across it.
+# normal boot does (arch/arm/lib/board.c:750). So on a normal boot no
+# garbage collection or wear levelling from the vendor side ever runs
+# across it.
+#
+# That holds for BOOTING. It does not hold for a burning session, which
+# calls the same function with a non-zero flag and does give nfdata a
+# layer. Re-flashing with the USB Burning Tool after installing may
+# therefore disturb this filesystem, and re-flashing with "erase flash"
+# certainly destroys it.
 #
 # NONE OF THIS HAS RUN ON REAL HARDWARE. The meson8b raw-NAND driver
 # underneath it has never been exercised on S805 silicon. Everything below
@@ -46,6 +53,7 @@ UBI_VOL="rootfs"
 
 die()  { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33mWarning:\033[0m %s\n' "$*" >&2; }
 
 [ "$(id -u)" -eq 0 ] || die "Run this as root."
 
@@ -119,11 +127,14 @@ MTD_EB=$(( $(cat "/sys/class/mtd/mtd${MTD_UBI_NR}/erasesize") ))
 MTD_PAGE=$(( $(cat "/sys/class/mtd/mtd${MTD_UBI_NR}/writesize") ))
 MTD_MIB=$(( MTD_SIZE / 1024 / 1024 ))
 
-# UBI overhead: 2 PEBs for the volume table, a handful reserved for bad-block
-# handling, plus 2 pages per PEB for the EC and VID headers (this driver has
-# no subpage writes, so each header costs a whole page).
+# UBI overhead, computed from the geometry rather than guessed:
+#   - 2 pages of every erase block go to the EC and VID headers. This driver
+#     sets NAND_NO_SUBPAGE_WRITE, so each header costs a whole page.
+#   - UBI holds back a bad-block reserve, 2% by default.
+#   - a few PEBs go to the volume table and the layout volume.
 USED_MIB=$(( $(df --output=used -BM / | tail -1 | tr -dc '0-9') ))
-AVAIL_MIB=$(( MTD_MIB - MTD_MIB / 50 - 8 ))
+HDR_MIB=$(( MTD_SIZE / MTD_EB * 2 * MTD_PAGE / 1024 / 1024 ))
+AVAIL_MIB=$(( MTD_MIB - HDR_MIB - MTD_MIB / 50 - 8 ))
 [ "${AVAIL_MIB}" -gt $((USED_MIB + 128)) ] \
 	|| die "Root filesystem uses ${USED_MIB}MiB but only about ${AVAIL_MIB}MiB would be
 available on ${MTD} after UBI overhead."
@@ -164,6 +175,9 @@ ubiformat "${MTD}" -y -q
 
 info "Attaching UBI"
 ubiattach -m "${MTD_UBI_NR}"
+# ubiattach returns as soon as the kernel is done; /dev/ubi0 is created
+# afterwards by udev, and the ubimkvol below opens it by path.
+udevadm settle 2>/dev/null || sleep 2
 
 UBI_DEV=""
 for d in /sys/class/ubi/ubi[0-9]*; do
@@ -177,6 +191,7 @@ done
 
 info "Creating volume '${UBI_VOL}' on ${UBI_DEV}"
 ubimkvol "/dev/${UBI_DEV}" -N "${UBI_VOL}" -m
+udevadm settle 2>/dev/null || sleep 2
 
 # ubimkvol picks the id; ask which one it chose rather than assuming 0.
 VOL_ID=""
@@ -204,13 +219,35 @@ trap cleanup EXIT
 info "Mounting ${VOL_DEV} on ${TARGET}"
 mount -t ubifs "${VOL_DEV}" "${TARGET}"
 
+# No -A. UBIFS has no POSIX ACL support at all -- fs/ubifs registers only
+# the user, trusted and security xattr handlers -- so -A turns any source
+# file carrying a non-trivial ACL into an rsync error. -X stays: UBIFS does
+# take the other xattr namespaces, which is what security labels need.
+#
+# -x stops at mount points, and on this board /boot is a separate vfat
+# partition (BOOTFS_TYPE="fat" in the board config), so it is skipped. That
+# is correct here and deliberate -- a NAND install has no /boot filesystem,
+# the kernel, initrd and dtb come out of the boot.img -- but it should be
+# visible rather than an accident of -x, hence the explicit exclude.
+#
+# rsync's exit 24 ("some files vanished") is routine when copying a live
+# system and must not abort the install; 23 (partial transfer) is reported
+# but also survivable, because the fixups below still have to run for the
+# copy to be bootable at all.
 info "Copying the running system (this takes a while)"
-rsync -aHAXx --info=progress2 \
+rsync_rc=0
+rsync -aHXx --info=progress2 \
 	--exclude='/dev/*' --exclude='/proc/*' --exclude='/sys/*' \
 	--exclude='/tmp/*' --exclude='/run/*' --exclude='/mnt/*' \
-	--exclude='/media/*' --exclude='/lost+found' \
+	--exclude='/media/*' --exclude='/lost+found' --exclude='/boot/*' \
 	--exclude="${TARGET}" \
-	/ "${TARGET}/"
+	/ "${TARGET}/" || rsync_rc=$?
+case "${rsync_rc}" in
+	0)  ;;
+	24) warn "rsync: some files vanished while copying a live system (exit 24). Continuing." ;;
+	23) warn "rsync: partial transfer (exit 23). Some files were not copied; check the log above." ;;
+	*)  die "rsync failed with exit ${rsync_rc}. The UBI volume is formatted but incomplete." ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Fix up the copy
@@ -238,10 +275,14 @@ for m in meson_nand ubi ubifs; do
 		|| echo "${m}" >> "${TARGET}/etc/initramfs-tools/modules"
 done
 
-# Armbian's own resize-on-first-boot would try to grow a partition that does
-# not exist here.
-rm -f "${TARGET}/root/.rootfs_resize" \
-      "${TARGET}/etc/systemd/system/multi-user.target.wants/armbian-resize-filesystem.service" \
+# Armbian's resize-on-first-boot would try to grow a partition that does not
+# exist here. /root/.rootfs_resize is NOT the enable marker -- it is an
+# optional rule file read by do_expand_partition() -- so removing it only
+# makes the service fall back to its default behaviour. The marker that
+# actually suppresses it is .no_rootfs_resize, and the unit is wanted by
+# basic.target, not multi-user.target.
+touch "${TARGET}/root/.no_rootfs_resize"
+rm -f "${TARGET}/etc/systemd/system/basic.target.wants/armbian-resize-filesystem.service" \
       2>/dev/null || true
 
 sync

@@ -24,9 +24,10 @@
  *     strength and the scrambler settings are confirmed against a dump
  *     taken with the vendor bootloader.
  *
- *   - It does NOT make the box boot from internal storage, and this
- *     project has not implemented anything that would. Two separate
- *     things are true and they are often conflated:
+ *   - Selecting this dtb does not by itself make the box boot from
+ *     internal storage; boot_nand in the u-boot environment is what
+ *     does that, and this dtb is what the running system then needs.
+ *     Two separate things are true and they are often conflated:
  *
  *       * The bootloader CAN read raw NAND. Our u-boot config defines
  *         CONFIG_NEXT_NAND. That one macro cuts both ways: it drops
@@ -150,9 +151,14 @@
 		 * Two more properties are absent on purpose:
 		 *
 		 *   nand-on-flash-bbt
-		 *     the driver forces NAND_BBT_NO_OOB with it, which writes
-		 *     Linux's own bad-block table into blocks at the end of
-		 *     the chip -- inside the area the vendor NFTL owns.
+		 *     the driver forces NAND_BBT_NO_OOB with it, and nand_bbt
+		 *     places the table in the last good blocks of the MASTER
+		 *     device (NAND_BBT_LASTBLOCK). With the partitions node
+		 *     below, the top of the chip is inside "ubi" -- so the
+		 *     table would be written into blocks UBI believes it owns
+		 *     and will erase. (Before the split the concern was the
+		 *     opposite one, the vendor area; the split moved the
+		 *     collision, it did not remove it.)
 		 *
 		 */
 

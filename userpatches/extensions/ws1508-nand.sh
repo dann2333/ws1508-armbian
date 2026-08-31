@@ -78,11 +78,6 @@ function custom_kernel_config__ws1508_nand() {
 	# not misdirect UBI at the vendor region.
 	kernel_config_set_n MTD_PARTITIONED_MASTER
 
-	if [[ "${slub_debug}" == "yes" ]]; then
-		kernel_config_set_y SLUB_DEBUG
-		kernel_config_set_y SLUB_DEBUG_ON
-	fi
-
 	# UBI/UBIFS: the root filesystem for a unit booting from internal
 	# NAND. UBI is what makes raw NAND usable as a rootfs medium at all
 	# -- it does the wear levelling and bad-block handling that the

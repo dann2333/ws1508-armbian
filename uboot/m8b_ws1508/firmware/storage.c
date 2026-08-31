@@ -7,23 +7,50 @@
  *   boot     - 256MB  FAT32 on eMMC / an Android boot.img on NAND
  *   rootfs   -  rest  ext4 root filesystem (eMMC only; see below)
  *
- * mask_flags is read by exactly one thing: amlnand_get_dev_num() in
- * drivers/amlnf/phy/chipenv.c, which sorts these entries into the three
- * amlnf "phy devices" nfcache (STORE_CACHE), nfcode (STORE_CODE) and
- * nfdata (STORE_DATA). Nothing on the eMMC path looks at it at all, so
- * the choice below is a pure NAND decision and changes nothing for an
- * eMMC unit.
+ * mask_flags drives the NAND layout: amlnand_get_dev_num() in
+ * drivers/amlnf/phy/chipenv.c sorts these entries into the three amlnf
+ * "phy devices" nfcache (STORE_CACHE), nfcode (STORE_CODE) and nfdata
+ * (STORE_DATA).
+ *
+ * It is NOT NAND-only, though, and an earlier version of this comment
+ * wrongly said it was. The eMMC path reads it too:
+ * drivers/mmc/emmc_partitions.c:198 copies it into the runtime table and
+ * mmc_partition_verify():408 compares it against the copy stored on the
+ * eMMC. So changing it here does have an eMMC consequence -- on the
+ * first boot after this bootloader is flashed, mmc_device_init() finds
+ * the stored table different and calls mmc_write_partition_tbl() to
+ * rewrite it (emmc_partitions.c, mmc_device_init). That rewrites the
+ * table RECORD only; it does not repartition or erase, so an installed
+ * eMMC system keeps working. It is a one-time write, not data loss, but
+ * it is not nothing and should not be described as nothing.
  *
  * resource and boot are STORE_CODE on purpose. The NFTL layer is a
- * prebuilt blob (drivers/amlnf/logic/libamlnf_logic_150311.z) and its
- * amlnf_logic_init() skips the nfdata device when called with flag 0 --
- * which is exactly how arch/arm/lib/board.c:750 calls it on every normal
- * boot. With all three partitions tagged STORE_DATA, as they were, a
- * NAND unit came up with NO NFTL devices at all: "store read boot",
- * "imgread kernel boot" and even the existing "imgread pic resource
- * bootup" in CONFIG_PREBOOT could never have worked. Moving the two
- * partitions the bootloader actually reads into nfcode is what makes
- * booting from internal NAND possible.
+ * prebuilt blob (drivers/amlnf/logic/libamlnf_logic_150311.z), and its
+ * amlnf_logic_init() decides per device whether to build a layer at all.
+ * Disassembled, with the two compared strings read out of
+ * .rodata.str1.1 (offset 0x22 "nfboot", 0x29 "nfdata"):
+ *
+ *   3988  strncmp(phydev->name, "nfboot", 6); beq skip   <- always
+ *   3994  cmp flag, #0; bne size_check                   <- flag != 0
+ *   39b8  strncmp(phydev->name, "nfdata", 6); beq skip   <- only flag 0
+ *   39c4  ldrd phydev->size; cmpeq #0x8000000; bls skip  <- <= 128MiB
+ *
+ * arch/arm/lib/board.c:750 calls it with flag 0 on every normal boot, so
+ * nfboot and nfdata get no NFTL devices then and nfcode and nfcache do.
+ * With all three partitions tagged STORE_DATA, as they were, they all
+ * landed on nfdata and a NAND unit came up with NO NFTL devices at all:
+ * "store read boot", "imgread kernel boot" and even the existing
+ * "imgread pic resource bootup" in CONFIG_PREBOOT could never have
+ * worked. Moving the two partitions the bootloader actually reads into
+ * nfcode is what makes booting from internal NAND possible.
+ *
+ * The same disassembly is why the Linux half of the chip is safe: with
+ * flag 0 nothing ever attaches NFTL to nfdata, so its garbage collection
+ * and wear levelling never run over the region UBI owns. Note the
+ * converse -- with a NON-zero flag, which is what a burning session
+ * uses, nfdata DOES get a layer. What that layer writes when it attaches
+ * is inside the blob and unknown, so treat any burn as capable of
+ * disturbing the UBI area.
  *
  * rootfs stays STORE_DATA, and that is also deliberate. It keeps the
  * name in the table for the eMMC burn path, while on NAND it lands in
@@ -49,12 +76,18 @@
  * erase levels reach that path, so any re-flash with erase ticked means
  * redoing the NAND install, not just the kernel half.
  *
- * WARNING: changing the name or size of any entry here changes the
- * partition table stored on the chip, and amlnand_configs_confirm()
- * (chipenv.c:1995) treats a mismatch against the on-chip copy as fatal
- * unless the burn was told to erase. The first flash of a bootloader
- * carrying a changed table MUST be done with the USB Burning Tool's
- * "erase flash" ticked. That erase also destroys the per-unit nkey/nsec
+ * WARNING: changing the name, size OR mask_flags of any entry here
+ * changes the partition table stored on the chip -- confirm_dev_para()
+ * compares the sorted per-device tables, so a pure mask_flags change
+ * moves partitions between devices and is caught exactly like a rename.
+ * amlnand_configs_confirm() (chipenv.c:1995) treats the mismatch as
+ * fatal unless the burn was told to erase.
+ *
+ * This very commit is such a change: nfcode goes from 0 partitions to 2
+ * and nfdata from 3 to 1, with no name or size touched. So "nothing was
+ * renamed or resized" is NOT a reason to skip it -- the FIRST flash of
+ * this bootloader onto any NAND unit MUST be done with the USB Burning
+ * Tool's "erase flash" ticked. That erase also destroys the per-unit nkey/nsec
  * records, which nothing in this project can restore -- see
  * docs/flashing.md.
  *

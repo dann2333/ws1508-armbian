@@ -14,17 +14,23 @@
 # image can only be built for a known page size, erase block size and LEB
 # size, and the fitted die is a Xunlei house-marked part whose geometry is
 # not published anywhere. The rootfs is therefore created on the box by
-# ws1508-install-to-nand, which reads the real geometry out of
-# /sys/class/mtd/mtd1/ before calling mkfs.ubifs.
+# ws1508-install-to-nand: ubiformat, ubiattach and ubimkvol on the MTD
+# partition labelled "ubi", then "mount -t ubifs" (which formats an empty
+# volume on a read-write mount, fs/ubifs/super.c:1283) and rsync of the
+# running system into it. UBI and UBIFS take the geometry from the device
+# itself, which is the whole reason no image can be built here.
 #
 # WHY AN ANDROID BOOT.IMG, of all things:
 #
 # This bootloader has no filesystem layer over NAND at all -- CONFIG_NEXT_NAND
-# drops libmtd.o/libnand.o (common/Makefile:165-168) -- so there is nothing to
-# fatload from. What it does have is "imgread kernel <part> <addr>", which
-# reads an Android boot.img out of a vendor partition, sizing the read from
-# the header (common/cmd_imgread.c:328), and a bootm that understands the
-# format. bootm takes all three pieces out of that single image:
+# drops libmtd.o and libnand.o from LIBS (the top-level Makefile:216-220, and
+# 228-232 substitutes the amlnf libraries) -- so there is nothing to fatload
+# from. What it does have is "imgread kernel <part> <addr>", which reads an
+# Android boot.img out of a vendor partition: a fixed IMG_PRELOAD_SZ of 1MiB
+# first (common/cmd_imgread.c:20, :321), then the rest sized from the header
+# at :342-345 -- header page + page-aligned kernel + page-aligned ramdisk +
+# second_size. And it has a bootm that understands the format, which takes
+# all three pieces out of that single image:
 #
 #   kernel   a legacy uImage at +0x800   (cmd_bootm.c:1108-1110)
 #   ramdisk  at align(0x800 + kernel_size, page_size), length ramdisk_size,
@@ -123,9 +129,10 @@ kernel, ramdisk, second = blobs
 if page != 0x800:
     sys.exit("page size must be 2048: bootm hard-codes +0x800 to reach the kernel")
 
-# The kernel slot must be a legacy uImage -- bootm reads its header for the
-# entry point and bails with "Could not find kernel entry point!" otherwise
-# (cmd_bootm.c:328-343).
+# The kernel slot must be a legacy uImage. bootm shifts past the Android
+# header and calls image_get_kernel() on what it finds; a bad magic there
+# prints "Bad Magic Number" (cmd_bootm.c:967) and then "ERROR: can't get
+# kernel image!" (cmd_bootm.c:246). Fail here instead, where the file is.
 if kernel[:4] != b'\x27\x05\x19\x56':
     sys.exit("kernel is not a legacy uImage (bad magic); bootm cannot find an entry point")
 
@@ -168,11 +175,19 @@ PY
 
 log "Wrote $(basename "${ANDR}") ($(stat -c%s "${ANDR}") bytes)"
 
-# The vendor "boot" partition is 256MiB (uboot/m8b_ws1508/firmware/storage.c).
-# NFTL holds back roughly a tenth of it, so warn well before the real edge.
+# Two ceilings, and the lower one is RAM, not flash. The vendor "boot"
+# partition is 256MiB (uboot/m8b_ws1508/firmware/storage.c) less the NFTL
+# spare, but "imgread kernel boot" loads the whole image at 0x16000000 and
+# this board has 512MiB of DRAM starting at 0, so only 0x20000000-0x16000000
+# = 160MiB is addressable above the load address. Past that the read walks
+# off the end of the mapping -- and update_ddr_mmu_table() zeroes the
+# descriptors beyond the detected size, so it faults rather than wrapping.
+# 128MiB leaves a margin under that.
+ANDR_MAX=$((128 * 1024 * 1024))
 ANDR_SIZE="$(stat -c%s "${ANDR}")"
-if (( ANDR_SIZE > 200 * 1024 * 1024 )); then
-	die "${ANDR} is ${ANDR_SIZE} bytes; the vendor 'boot' partition is 256MiB and NFTL reserves part of that."
+if (( ANDR_SIZE > ANDR_MAX )); then
+	die "${ANDR} is ${ANDR_SIZE} bytes, over the ${ANDR_MAX}-byte limit. That limit is
+DRAM above the 0x16000000 load address, not the size of the vendor partition."
 fi
 
 # ---------------------------------------------------------------------------
@@ -202,9 +217,29 @@ if [[ -d "${BURN_BASE}" ]]; then
 		VERIFY:boot:normal:boot.VERIFY
 	EOF
 
-	log "Packing ws1508-nand.burn.img"
-	"${AMLIMG}" pack "${NANDOUT}/ws1508-nand.burn.img" "${BURN}/"
-	log "Wrote ${NANDOUT}/ws1508-nand.burn.img"
+	NAND_BURN="${NANDOUT}/ws1508-nand.burn.img"
+	log "Packing $(basename "${NAND_BURN}")"
+	"${AMLIMG}" pack "${NAND_BURN}" "${BURN}/"
+
+	# Round-trip the result, exactly as make-burn-image.sh does. This package
+	# carries the bootloader, and a half-written bootloader on a NAND unit is
+	# the one failure mode a user cannot recover from without a serial cable.
+	# It also catches a truncated burn-base, which on CI arrives over
+	# actions/download-artifact and is not otherwise checked here.
+	VERIFY_DIR="${WORKDIR}/burn-nand-verify"
+	rm -rf "${VERIFY_DIR}"
+	"${AMLIMG}" unpack "${NAND_BURN}" "${VERIFY_DIR}/" >/dev/null
+
+	# AmlImg names extracted members "<index>.<name>.<TYPE>", e.g. "0.DDR.USB".
+	for want in DDR.USB UBOOT_COMP.USB bootloader.PARTITION boot.PARTITION; do
+		if ! compgen -G "${VERIFY_DIR}/*.${want}" > /dev/null \
+		   && ! compgen -G "${VERIFY_DIR}/*.${want}.sparse" > /dev/null; then
+			die "Packed NAND burn image is missing ${want}"
+		fi
+	done
+	rm -rf "${VERIFY_DIR}"
+
+	log "Wrote ${NAND_BURN}"
 else
 	warn "No ${BURN_BASE}; skipping the burn package. Run scripts/build-uboot.sh to get one."
 fi

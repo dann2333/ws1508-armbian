@@ -140,7 +140,7 @@ cat /proc/cmdline | tr ' ' '\n' | grep ws1508.store
 审查或 rebase 的时候请数够 5 个 —— 尤其是 `0102`，
 它是 `meson_nand.allow_write=1` 和厂商引导区之间唯一的东西。
 
-### 先说清楚：这**不会**让机器从内置存储启动
+### 先说清楚：引导程序怎么读 NAND，以及为什么两边不能共用区域
 
 不会，但理由不是「引导程序读不到 NAND」——那句话本仓库早先版本写过，是错的。
 准确的分界线是：
@@ -150,15 +150,18 @@ cat /proc/cmdline | tr ' ' '\n' | grep ws1508.store
   `drivers/mtd/libmtd.o` 和 `drivers/mtd/nand/libnand.o` 从构建里踢掉
   （`Makefile:216-226`），所以 `fatload` 不可能从 NAND 上的某个文件系统里
   读出 uImage。
-- 但引导程序**能按裸偏移读 NAND**。同一个宏把 `common/store_interface.o`
+- 但引导程序**能读 NAND**。同一个宏把 `common/store_interface.o`
   编了进去（`common/Makefile:173-176`）：`store read <名字> <地址> <偏移> <长度>`
-  在探测到 NAND 时转成 `amlnf read_byte`（`common/store_interface.c:293-311`），
-  用法说明就写着「read 'size' bytes … skipping bad blocks」（`:938`）。
+  在探测到 NAND 时转成 `amlnf read_byte`（`common/store_interface.c:293-311`）。
   厂商 3.10 固件就是靠这条路从内置 NAND 启动的。
-- 但 `store read` 走的是 **NFTL**（`aml_nftl_get_dev()` 按分区名查表，
-  `drivers/amlnf/dev/cmd_amlnf.c:304-328`），不是裸偏移。这一层只有
-  编译好的二进制（`drivers/amlnf/logic/libamlnf_logic_150311.z`），
-  所以 Linux 永远算不出它的逻辑→物理映射。**两边不能共用同一块区域。**
+- **但那不是裸偏移。** 命令自带的用法说明写着「off|partition」，
+  是从 `cmd_nand` 抄来的、已经不成立的话：偏移永远按十六进制数解析
+  （`get_off_size()`，`store_interface.c:84-100`），而第一个参数
+  `<名字>` 是拿去 `aml_nftl_get_dev()` 按名字查 **NFTL** 设备的
+  （`drivers/amlnf/dev/cmd_amlnf.c:304-328`）。这一层只有编译好的二进制
+  （`drivers/amlnf/logic/libamlnf_logic_150311.z`，目录里没有源码），
+  映射表存在页的 OOB 里，所以 Linux 永远算不出它的逻辑→物理映射。
+  **两边不能共用同一块区域。**
 
 **从内置 NAND 启动现在实现了**，办法是按物理位置把芯片切开：厂商栈拿
 前 384MiB（引导页 + 元数据窗口 + 它要读的 NFTL 分区），Linux 拿剩下的
@@ -171,8 +174,9 @@ Linux 则在 `/dev/mtd1` 上挂 UBIFS 根。整条路写在 U-Boot 环境变量
 细节见 README「NAND 版：从内置 NAND 启动」，装机步骤见
 [flashing.md](flashing.md)。**一次都没在实机上跑过。**
 
-内核这边**期望**给出的是一个 `/dev/mtd0`：把闪存**读**出来，仅此而已。
-写「期望」是因为这个驱动从来没在 meson8b 芯片上跑过 —— 见下面
+内核这边**期望**给出两个 MTD：`/dev/mtd0`（`vendor`，前 384MiB，
+设备树里就写死只读）和 `/dev/mtd1`（`ubi`，剩下的，UBI 根文件系统装在
+这里）。写「期望」是因为这个驱动从来没在 meson8b 芯片上跑过 —— 见下面
 「已知没验证过的地方」。
 
 ### 怎么开
@@ -228,8 +232,9 @@ SD 卡槽在 `&sdio` 上，不受影响。
 
 > ⚠️ 镜像里装了 `mtd-utils`（`ws1508-nand-probe` 要用它的 `nanddump`）。
 > Debian / Ubuntu 是一个合并的包，所以 `flash_erase`、`nandwrite`、
-> `nandtest`、`ubiformat` 也一并装进来了 —— 内核没开 `MTD_UBI` 挡不住
-> `ubiformat`，它是直接对 `/dev/mtdN` 发 `MEMERASE` / `MEMWRITE`。
+> `nandtest`、`ubiformat` 也一并装进来了。`MTD_UBI` 现在是开的
+> （`MTD_UBI=m`，NAND 根文件系统要用），不过就算不开也挡不住
+> `ubiformat` —— 它是直接对 `/dev/mtdN` 发 `MEMERASE` / `MEMWRITE`。
 > **别把这些工具指向 `/dev/mtd0`。** 拦着它们的只有驱动里那两道：
 > 不加 `meson_nand.allow_write=1` 时整个 MTD 是只读的，
 > 以及厂商引导区那道无论如何都不放行的地址闸。

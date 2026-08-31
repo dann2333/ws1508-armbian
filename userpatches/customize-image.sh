@@ -339,15 +339,29 @@ install_helper() {
 		    echo "type:    no eMMC detected - this is most likely a raw-NAND unit"
 		    echo
 		    if [ -e /sys/class/mtd/mtd0 ]; then
-		        mtdsize=$(cat /sys/class/mtd/mtd0/size 2>/dev/null || echo 0)
-		        mtdflags=$(cat /sys/class/mtd/mtd0/flags 2>/dev/null || echo 0)
-		        echo "mtd0:    $((mtdsize / 1024 / 1024)) MB, erase block $(cat /sys/class/mtd/mtd0/erasesize) B, page $(cat /sys/class/mtd/mtd0/writesize) B"
-		        # 0x400 is MTD_WRITEABLE; the driver clears it by default
-		        if [ $((mtdflags & 0x400)) -eq 0 ]; then
-		            echo "access:  READ-ONLY (the driver's default)"
-		        else
-		            echo "access:  writable - meson_nand.allow_write=1 is set"
-		        fi
+		        # Report per partition. The device tree splits the chip into
+		        # a read-only "vendor" region and a writable "ubi" one, so
+		        # mtd0's size is NOT the chip size and mtd0's flags can never
+		        # show writable however meson_nand.allow_write is set.
+		        for d in /sys/class/mtd/mtd[0-9]*; do
+		            case "${d}" in *ro) continue ;; esac
+		            [ -r "${d}/name" ] || continue
+		            mtdsize=$(cat "${d}/size" 2>/dev/null || echo 0)
+		            mtdflags=$(cat "${d}/flags" 2>/dev/null || echo 0)
+		            # 0x400 is MTD_WRITEABLE
+		            if [ $((mtdflags & 0x400)) -eq 0 ]; then
+		                acc="read-only"
+		            else
+		                acc="WRITABLE"
+		            fi
+		            printf '%-9s %-8s %5s MB  %s\n' "${d##*/}:" \
+		                "$(cat "${d}/name")" "$((mtdsize / 1024 / 1024))" "${acc}"
+		        done
+		        echo "geometry: erase block $(cat /sys/class/mtd/mtd0/erasesize) B, page $(cat /sys/class/mtd/mtd0/writesize) B"
+		        # The module parameter is the global switch; a partition can
+		        # still be read-only on top of it because the dts says so.
+		        aw=$(cat /sys/module/meson_nand/parameters/allow_write 2>/dev/null || echo '?')
+		        echo "allow_write: ${aw}  (N = the driver's read-only default)"
 		        echo
 		        echo "The raw-NAND driver is bound and enumerated the chip."
 		        echo "Whether it is reading it CORRECTLY is a separate"
@@ -382,14 +396,13 @@ install_helper() {
 		        echo "     meson8b silicon. Check dmesg for meson-nand."
 		        echo
 		        echo "Read the notes beside that fdtfile line first: it is"
-		        echo "experimental and unvalidated, it gives a READ-ONLY"
-		        echo "mtd if it works at all, and it does NOT let the box"
-		        echo "boot from internal storage."
+		        echo "experimental and unvalidated, and the MTDs it gives"
+		        echo "you are read-only unless you also ask for writes."
+		        echo
+		        echo "Until then the root filesystem stays on USB or SD."
+		        echo "Flash ws1508-uboot.burn.img (bootloader only) and boot"
+		        echo "the system from a USB stick."
 		    fi
-		    echo
-		    echo "The root filesystem stays on USB or SD on this variant."
-		    echo "Flash ws1508-uboot.burn.img (bootloader only) and boot the"
-		    echo "system from a USB stick."
 		fi
 		echo
 		echo "--- current root ---"

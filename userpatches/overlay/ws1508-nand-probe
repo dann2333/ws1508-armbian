@@ -19,11 +19,10 @@
 # here exists to find out whether it works at all, not to put data on the
 # chip.
 #
-# Reminder: none of this makes the box boot from NAND, and this project
-# has not implemented anything that would. The bootloader can read raw
-# NAND -- "store read <name> <addr> <off> <size>" dispatches to the amlnf
-# driver, which is how the vendor 3.10 firmware boots -- but it has no
-# filesystem layer over the flash (CONFIG_NEXT_NAND drops libmtd.o and
+# On its own this dtb does not make the box boot from NAND. The bootloader
+# can read the flash -- "store read <name> <addr> <off> <size>" dispatches
+# to the amlnf driver, which is how the vendor 3.10 firmware boots -- but
+# it has no filesystem layer over it (CONFIG_NEXT_NAND drops libmtd.o and
 # libnand.o), so there is nothing to fatload from it.
 #
 # Booting from internal NAND IS now implemented, by going around that
@@ -38,8 +37,8 @@ set -euo pipefail
 # Which MTD to inspect. With the partitions node in meson8b-ws1508-nand.dts
 # mtd0 is the read-only "vendor" region and mtd1 is the UBI one, so the
 # default here is no longer "the whole chip" -- pass a number to look at
-# another partition. Every partition is backed by the same die, so the
-# geometry lines below read the same on all of them.
+# another partition. erasesize, writesize and oobsize are die-wide and read
+# the same on every partition; name, size and flags are per-partition.
 MTD_NR="${1:-0}"
 case "${MTD_NR}" in
 	''|*[!0-9]*) printf 'Usage: %s [mtd-number]\n' "${0##*/}" >&2; exit 2 ;;
@@ -142,10 +141,19 @@ if grep -qw "${SYS##*/}" /proc/mtd && [ -r "${SYS}/flags" ]; then
 	printf '  %-11s %s\n' flags "$(cat "${SYS}/flags")"
 fi
 
-# 0x400 = MTD_WRITEABLE. Absent means the driver's read-only default is in
-# force, which is what a machine that has not been validated should show.
+# 0x400 = MTD_WRITEABLE. Two independent things clear it, so report both
+# rather than letting one mask the other:
+#
+#   - the module parameter, which is the driver's global read-only default
+#   - the device tree, which marks the "vendor" partition read-only for
+#     good and would otherwise make mtd0 look "safe" on a box that has
+#     allow_write=1 set and mtd1 wide open.
+allow_write=$(cat /sys/module/meson_nand/parameters/allow_write 2>/dev/null || echo '?')
+echo "  meson_nand.allow_write = ${allow_write}  (module-wide switch)"
 if [ -r "${SYS}/flags" ] && [ $(( $(cat "${SYS}/flags") & 0x400 )) -eq 0 ]; then
-	echo "  -> read-only (the driver's default). Good."
+	echo "  -> mtd${MTD_NR} is read-only. That is either the driver default"
+	echo "     or the device tree marking this partition read-only; the"
+	echo "     line above says which."
 else
 	echo "  -> WRITABLE. meson_nand.allow_write=1 is in effect. Erase,"
 	echo "     program, OOB write and mark-bad are still refused below the"
@@ -189,8 +197,14 @@ if [ "${blocks}" -lt 100 ]; then
 fi
 length=$((erasesize * blocks))
 
-printf '  Dump the first %s blocks (%s bytes, covering the write-protected\n' "${blocks}" "${length}"
-printf '  vendor region)? [y/N] '
+printf '  Dump the first %s blocks (%s bytes) of mtd%s "%s"?\n' \
+	"${blocks}" "${length}" "${MTD_NR}" "$(cat "${SYS}/name" 2>/dev/null || echo '?')"
+if [ "${MTD_NR}" = "0" ]; then
+	printf '  On mtd0 that covers the write-protected vendor region.\n'
+else
+	printf '  NOTE: offsets are relative to this partition, not the chip.\n'
+fi
+printf '  [y/N] '
 read -r answer
 case "${answer}" in
 	[yY]*) ;;

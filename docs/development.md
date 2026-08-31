@@ -14,9 +14,12 @@ S805 片内 ROM
                  └─ u-boot
                       ├─ update 1000        留 1 秒给 USB 烧录工具
                       ├─ get_device_boot_flag()  探测 NAND → eMMC
-                      └─ bootcmd: usb → sd → emmc
-                           └─ fatload ${bootdev} boot.scr && autoscr
-                                └─ Armbian boot.scr（由 boot-ws1508.cmd 编译而来）
+                      └─ bootcmd: usb → sd → emmc → nand
+                           ├─ 前三档：fatload ${bootdev} boot.scr && autoscr
+                           │    └─ Armbian boot.scr（由 boot-ws1508.cmd 编译而来）
+                           └─ nand（boot_nand，仅 ${store}=1）：不经过 boot.scr
+                                └─ imgread kernel boot ${addr} && bootm ${addr}
+                                     └─ Android boot.img：uImage + 裸 initrd + dtb
                                      ├─ 读 armbianEnv.txt 拿 rootdev
                                      ├─ fatload uImage / uInitrd / dtb/${fdtfile}
                                      └─ bootm
@@ -124,8 +127,10 @@ $ arm-none-eabi-objdump -d build/arch/arm/lib/board.o | sed -n '/<get_device_boo
 ### 3. 启动顺序
 
 玩客云的 `CONFIG_BOOTCOMMAND` 只有 `run boot_emmc_armbian`，
-NAND 机器无路可走。本项目改成 `usb → sd → emmc`，
+NAND 机器无路可走。本项目改成 `usb → sd → emmc → nand`，
 既让 NAND 机器能从 U 盘跑，也给所有机器留了一条不用拆机的救砖通道。
+NAND 那一档排在最后是故意的：插着 U 盘就一定优先 U 盘，
+所以内置系统装挂了也总有退路。
 
 ---
 

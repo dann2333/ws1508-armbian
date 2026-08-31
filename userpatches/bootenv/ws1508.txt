@@ -71,13 +71,12 @@ console="both"
 #   USB and eMMC boots. The NAND kernel command line lives in the u-boot
 #   environment instead, as ${nandargs}, editable with setenv/saveenv.
 #   What it does NOT do:
-#     - it does not let the box boot from internal storage. Not because
-#       the bootloader cannot read NAND -- it can, with
-#       "store read"/"amlnf read", which is how vendor firmware boots --
-#       but because it has no filesystem layer over NAND (fatload cannot
-#       work there) and nothing in THIS project implements a store-read
-#       boot path or a rootfs on the vendor NFTL. The kernel, initrd and
-#       dtb come off USB or SD.
+#     - selecting it does not by itself boot the box from internal
+#       storage. That is boot_nand in the u-boot environment, which runs
+#       only after USB, SD and eMMC have all failed, and which needs the
+#       kernel already installed in the vendor "boot" partition. This
+#       line is what the RUNNING system needs (to see the flash at all,
+#       and to install to it); it is not the boot switch.
 #     - it does not give you writable internal storage. The MTD is
 #       read-only unless you also add meson_nand.allow_write=1 to
 #       extraargs. There are two barriers, not one: without that
