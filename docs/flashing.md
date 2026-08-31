@@ -68,8 +68,9 @@ IP 从路由器的 DHCP 客户端列表里找，主机名是 `ws1508`。
 
 ## 二、NAND 版：刷引导 + U 盘跑系统
 
-NAND 版机器在本项目里**跑不了**把根文件系统放进内置存储这条路。
-能做的是把引导刷进 NAND，然后从 U 盘启动。
+这是 NAND 版的**推荐做法**，也是唯一在逻辑上没有未验证前提的做法：
+把引导刷进 NAND，系统跑在 U 盘上。想把系统也装进 NAND，
+见下面「二（进阶）」——那条路已经实现，但一次都没在实机上跑过。
 
 > 为什么，说准一点：引导程序里**没有文件系统层**
 > （`CONFIG_NEXT_NAND` 让 Amlogic 的 Makefile 把 `libmtd.o` / `libnand.o`
@@ -77,14 +78,11 @@ NAND 版机器在本项目里**跑不了**把根文件系统放进内置存储�
 > 但引导程序**能按裸偏移读 NAND**（`store read` / `amlnf read`，
 > 厂商 3.10 固件就是这么启动的）。
 >
-> 也就是说这是**本项目没有实现**的一条路，不是原理上做不到 ——
-> 缺的是一个走 `store read` 的启动脚本，和一个能挂在厂商 NFTL 上的
-> 根文件系统方案。两样都没有，也都没验证过。详见
-> [`hardware.md`](hardware.md) 的「裸 NAND：能做什么、不能做什么」。
+> 而且 `store read` 走的是厂商 NFTL，不是裸偏移 —— 那一层只有二进制，
+> Linux 复现不了。所以**不能**让引导程序和 Linux 共用同一块区域。
 >
-> 内核那边现在**有**一个实验性的 meson8b 裸 NAND 驱动（默认关闭）。
-> 打开之后**期望**能得到一个只读的 `/dev/mtd0` 把闪存读出来看 ——
-> 写「期望」是因为它从来没在 meson8b 芯片上跑过。
+> 绕开的办法是按物理位置切开芯片，这条路本项目**已经实现了**，
+> 见下面「装到内置 NAND（实验性）」。**一次都没在实机上跑过。**
 
 ### 1. 刷 U-Boot
 
@@ -112,6 +110,115 @@ sudo dd if=Armbian_*_ws1508_*.img of=/dev/sdX bs=4M status=progress conv=fsync
 > ⚠️ 这机器**只有一个 USB 口**，被系统盘占掉之后就没有别的口了。
 > 想再接硬盘得用 USB Hub —— 注意 Hub 要带独立供电，
 > 这个口带不动 2.5 寸机械盘。
+
+---
+
+## 二（进阶）、NAND 版：把系统装进内置 NAND
+
+> ⚠️ **一次都没在实机上跑过。** 底下那个 meson8b 裸 NAND 驱动
+> 从来没在 S805 芯片上运行过，这一节的每一步都建立在读代码而不是
+> 实测之上。做之前先把「救砖」那一节读完 —— 退路是 U 盘，
+> 而且 U-Boot 的启动顺序（USB → SD → eMMC → NAND）保证了
+> 插上 U 盘就一定能回来。
+
+### 先理解这件事：芯片被切成两半
+
+厂商的 NFTL 只有编译好的二进制，Linux 复现不了它的逻辑→物理映射，
+所以两边不能共用同一块区域。物理上切开：
+
+| 物理范围 | 归谁 | 谁能写 |
+|---|---|---|
+| 0 – 384MiB | 厂商 `amlnf`（引导页、元数据、`nkey`/`nsec`、引导要读的 NFTL 分区） | 只有 USB 烧录工具 / U-Boot |
+| 384MiB – 末尾 | Linux（UBI + UBIFS 根） | 只有 Linux |
+
+**内核那一半 Linux 写不了，根文件系统那一半 U-Boot 读不了。**
+所以装机必然是两步，用两个不同的工具。
+
+### 1. 刷 `ws1508-nand.burn.img`（引导 + 内核）
+
+这个包 = 引导程序 + 一个 Android boot.img（里面是 uImage、裸 initrd、
+NAND 版 dtb），后者写进厂商 `boot` 分区。
+
+> 🔴 **第一次刷必须勾上「擦除 flash」（Erase flash）。**
+>
+> 本项目改了分区表的 `mask_flags`（把 `resource` 和 `boot` 挪进
+> `nfcode`，否则 NFTL 那个 blob 在正常启动时根本不会给它们建设备，
+> `store read` / `imgread` 一个都用不了）。而
+> `amlnand_configs_confirm()`（`chipenv.c:1995`）会拿编译进去的表和
+> 芯片上存的那份逐字段比对，**对不上就直接失败**，只有烧录工具告诉它
+> 「这次要擦」时才放行。
+>
+> 代价是：**擦除会一并抹掉一机一份的 `nkey` / `nsec`，永久丢失。**
+> 本项目没有任何办法备份或恢复它们（而且这个 U-Boot 里那道
+> 「保护 key 区不被擦」的判断是空的 —— 它依赖的字段只在
+> `CONFIG_SECURITYKEY` 下才会被填，而这个宏没开）。
+> 对跑 Armbian 的机器来说这些 key 没有用处，但这是不可逆的，
+> 想留着原厂固件可能性的人到此为止。
+
+### 2. 做启动 U 盘，从 U 盘启动
+
+和上面「二、」的第 2、3 步一样。
+
+### 3. 打开 NAND 设备树
+
+进系统后编辑 `/boot/armbianEnv.txt`，加两行：
+
+```
+fdtfile=meson8b-ws1508-nand.dtb
+extraargs=meson_nand.allow_write=1
+```
+
+重启，然后确认：
+
+```bash
+cat /proc/mtd          # 应该看到 mtd0 "vendor" 和 mtd1 "ubi"
+ws1508-nand-probe      # 打印几何、ECC、只读标志
+ws1508-nand-probe 1    # 同上，看 UBI 那个分区
+```
+
+**这一步就是实机验证点。** `ws1508-nand-probe` 的输出里有三件事决定
+后面能不能做：料是不是 SLC（UBI 不收 MLC）、页大小是不是 ≤4096、
+以及厂商写过的页读回来 ECC 有没有过。任何一条不对，就停在这里。
+
+### 4. 装根文件系统
+
+```bash
+sudo ws1508-install-to-nand
+```
+
+它会检查 `store=1`、`allow_write=1`、两个分区标签都在，然后
+`ubiformat` → `ubimkvol` → 挂上 → `rsync` 整个系统过去，
+并且写好 `/etc/fstab` 和 initramfs 模块列表。
+`/dev/mtd0`（前 384MiB）在设备树里就是只读的，不会被碰。
+
+### 5. 拔掉 U 盘，开机
+
+```
+Try to boot from USB...Fail
+Try to boot from SD...Fail
+Try to boot from eMMC...Fail
+Try to boot from NAND...
+## ANDROID Format IMAGE
+```
+
+看到最后两行就说明 `imgread` 读到了。**不拔 U 盘就还是从 U 盘启动** ——
+这既是注意事项，也是退路。
+
+### 注意：以后任何一次「擦除 flash」都会连根文件系统一起抹掉
+
+`store erase data` 在 NAND 上是连着擦 `data`、`code`、`cache` 三个设备的
+（`common/store_interface.c:220-241`），而烧录工具的擦除档位走的就是这条路。
+所以只要再刷一次并勾了擦除，UBI 根文件系统和内核都没了，
+第 4 步要重做。不勾擦除的普通刷写不受影响。
+
+### 内核更新怎么办
+
+`apt upgrade` 升级内核**不会**更新 NAND 里的那一份：它在 NFTL 后面，
+Linux 写不了。要更新就重新生成 `ws1508-nand.burn.img` 再刷一次
+（这次不用勾擦除，分区表没变）。或者在 U-Boot 命令行里用
+`usb_update boot ws1508-nand-boot.andr` 从 U 盘写。
+
+这是这条路的真实代价，权衡之后再决定要不要走。
 
 ---
 

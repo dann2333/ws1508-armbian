@@ -356,15 +356,16 @@ install_helper() {
 		        echo "settings are confirmed to match the vendor, reads of"
 		        echo "vendor-written pages may come back uncorrectable."
 		        echo
-		        echo "It still cannot be booted from. Not because u-boot"
-		        echo "cannot read NAND -- it can, with 'store read' /"
-		        echo "'amlnf read', which is how vendor firmware boots --"
-		        echo "but because it has no filesystem layer over NAND and"
-		        echo "this project implements no store-read boot path and no"
-		        echo "rootfs for the vendor NFTL. Unimplemented, not"
-		        echo "impossible. Kernel, initrd and dtb come off USB or SD."
+		        echo "Booting from it IS implemented, but has never run on"
+		        echo "real silicon: the bootloader reads an Android boot.img"
+		        echo "from the vendor 'boot' partition, and Linux roots on a"
+		        echo "UBI volume in /dev/mtd1. Right now this box is running"
+		        echo "from USB, SD or eMMC."
 		        echo
-		        echo "Run 'ws1508-nand-probe' to inspect or dump it."
+		        echo "Run 'ws1508-nand-probe' to inspect or dump the flash."
+		        echo "Run 'ws1508-install-to-nand' to install the root"
+		        echo "filesystem -- read docs/flashing.md first, the kernel"
+		        echo "half needs the USB Burning Tool."
 		    else
 		        echo "There is no /dev/mtd0. Two possible reasons:"
 		        echo
@@ -417,6 +418,30 @@ install_helper() {
 			/usr/local/sbin/ws1508-nand-probe
 	fi
 
+	# The on-device NAND installer. Writes only the UBI root filesystem;
+	# the kernel side goes into the vendor "boot" partition with the USB
+	# Burning Tool, because that partition is behind Amlogic's NFTL. Also
+	# harmless on an eMMC unit: it refuses to run unless the bootloader
+	# reported store=1 and the running device tree gave it an MTD
+	# partition labelled "ubi".
+	if [ -r /tmp/overlay/ws1508-install-to-nand ]; then
+		install -m 0755 /tmp/overlay/ws1508-install-to-nand \
+			/usr/local/sbin/ws1508-install-to-nand
+	fi
+
+	# A UBIFS root has to be mountable before the root filesystem exists,
+	# so the modules have to be in the initramfs. Listing them here means
+	# the USB image already carries an initramfs that can mount NAND --
+	# which is what the Android boot.img packed by scripts/make-nand-image.sh
+	# picks up, since it takes the initrd straight out of the built image.
+	# ws1508-install-to-nand writes the same three lines into the system it
+	# installs, so a later update-initramfs there keeps them.
+	for _mod in meson_nand ubi ubifs; do
+		grep -qxF "${_mod}" /etc/initramfs-tools/modules 2>/dev/null \
+			|| echo "${_mod}" >> /etc/initramfs-tools/modules
+	done
+	unset _mod
+
 	# Show the essentials, including the default-password warning, on login.
 	cat > /etc/update-motd.d/09-ws1508 <<-EOF
 		#!/bin/sh
@@ -425,6 +450,7 @@ install_helper() {
 		echo "  Run 'ws1508-info' to see RAM, storage type and root device."
 		echo "  Booted from USB on an eMMC unit? 'ws1508-install-to-emmc'"
 		echo "  copies this system to the internal eMMC."
+		echo "  On a raw-NAND unit: 'ws1508-install-to-nand' (experimental)."
 	EOF
 	if [ "${ROOT_PASSWORD_LOGIN}" = "yes" ] && [ -z "${SSH_KEY}" ]; then
 		cat >> /etc/update-motd.d/09-ws1508 <<-EOF

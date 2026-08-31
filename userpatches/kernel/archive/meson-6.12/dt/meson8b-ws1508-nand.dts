@@ -39,17 +39,23 @@
  *         (store_interface.c:293-311). That is how the vendor 3.10
  *         firmware boots from internal flash.
  *
- *       * This project's boot script only ever fatloads from usb/sd/mmc,
- *         so nothing here uses that path, and Linux still has no way to
- *         root a filesystem on the vendor NFTL. uImage, uInitrd and this
- *         dtb come off USB or SD.
+ *       * But that path is NFTL-logical, not raw: the name is looked up
+ *         with aml_nftl_get_dev() and the data goes through a page-level
+ *         FTL that ships only as a blob. Linux cannot reproduce its
+ *         mapping, so the two sides cannot share a region of the chip.
  *
- *     So internal boot is unimplemented here, not impossible in
- *     principle. If you want to work on it, "store read" is the hook.
+ *     Internal boot IS implemented, by splitting the chip physically
+ *     instead: the bootloader reads an Android boot.img out of the
+ *     vendor "boot" partition with "imgread kernel boot" (the boot_nand
+ *     entry in the u-boot environment), and Linux roots on UBI in the
+ *     partition below. See the partitions node at the end of this file
+ *     for where the line is drawn and why. None of it has run on real
+ *     silicon.
  *
  *   - What this dtb gives you, IF the driver enumerates the chip, is
- *     /dev/mtd0: read-only by default, enough to dump the flash and
- *     compare it against a vendor dump. Making it writable needs
+ *     /dev/mtd0 "vendor" (read-only, the region above) and /dev/mtd1
+ *     "ubi". mtd0 is enough to dump the vendor area and compare it
+ *     against a vendor dump. Making mtd1 writable needs
  *     meson_nand.allow_write=1 on the kernel command line, and even then
  *     the driver refuses every erase, program, OOB write and mark-bad
  *     below its vendor-region boundary.
@@ -148,11 +154,85 @@
 		 *     Linux's own bad-block table into blocks at the end of
 		 *     the chip -- inside the area the vendor NFTL owns.
 		 *
-		 *   partitions
-		 *     offsets cannot be computed without the geometry, and
-		 *     with none declared /dev/mtd0 is the whole chip. Until
-		 *     then the driver's own address guard is what keeps the
-		 *     vendor region intact.
 		 */
+
+		/*
+		 * The chip is split between two owners that cannot read each
+		 * other's data, so the boundary below is the whole contract.
+		 *
+		 * Below it the vendor's amlnf stack owns the flash:
+		 *
+		 *   0x00000000  4 x 256 = 1024 boot pages, read by the mask
+		 *               ROM (drivers/amlnf/phy/boot_operation.c).
+		 *               2MiB on a 2K-page part.
+		 *   0x00200000  RESERVED_BLOCK_CNT = 48 *good* blocks holding
+		 *               the BBT, the nand config, the u-boot
+		 *               environment and the per-unit nkey/nsec
+		 *               (phynand.h:137, chipenv.c:435-476). 6MiB at
+		 *               128KiB blocks, and it slides one block higher
+		 *               per factory bad block inside the window.
+		 *   0x00800000  the nfcode phy device: the "resource" (4MiB)
+		 *               and "boot" (256MiB) NFTL partitions from
+		 *               uboot/m8b_ws1508/firmware/storage.c, inflated
+		 *               by 1/8 for NFTL spare (phydev.c) -- about
+		 *               292MiB, so ending near 300MiB.
+		 *
+		 * Everything in there is reached through a page-level FTL
+		 * that ships only as a prebuilt blob
+		 * (drivers/amlnf/logic/libamlnf_logic_150311.z), with its
+		 * logical-to-physical map in the OOB. Linux cannot read it
+		 * and must not write it.
+		 *
+		 * 384MiB is that ~300MiB with room for bad blocks and for the
+		 * NFTL spare ratio being larger than assumed. It costs 84MiB
+		 * of a 4GiB chip, which is the cheapest possible insurance
+		 * against the one mistake that cannot be undone.
+		 *
+		 * Above it Linux owns raw MTD. That region falls inside the
+		 * nfdata phy device, and nfdata is the one device the blob's
+		 * amlnf_logic_init() skips when u-boot calls it with flag 0 --
+		 * which is what arch/arm/lib/board.c:750 does on every normal
+		 * boot. So no NFTL garbage collection or wear levelling ever
+		 * runs over it, which is precisely why it is safe for UBI.
+		 * Keeping "rootfs" tagged STORE_DATA in the u-boot partition
+		 * table is what puts it there; do not retag it STORE_CODE.
+		 *
+		 * Both offsets are multiples of 4MiB, so they stay
+		 * erasesize-aligned for every plausible geometry. An
+		 * unaligned partition is silently forced read-only by
+		 * mtdpart.c, which would look exactly like a driver bug.
+		 *
+		 * Sizes assume the documented 4GiB (32Gbit) die. On a smaller
+		 * one mtdpart truncates the last partition and warns rather
+		 * than failing, so this is safe to get wrong in that
+		 * direction.
+		 */
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			/*
+			 * Read-only on top of the driver's own address guard,
+			 * which only reaches max(1024 pages + 64 blocks,
+			 * 16MiB) and so does NOT cover the nfcode span above
+			 * it. This is the part that does.
+			 */
+			partition@0 {
+				label = "vendor";
+				reg = <0x00000000 0x18000000>;
+				read-only;
+			};
+
+			/*
+			 * 3712MiB. The bootloader says ubi.mtd=ubi and the
+			 * installer looks partitions up by label, so this
+			 * string is load-bearing: renaming it breaks both.
+			 */
+			partition@18000000 {
+				label = "ubi";
+				reg = <0x18000000 0xe8000000>;
+			};
+		};
 	};
 };

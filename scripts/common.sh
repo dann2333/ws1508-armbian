@@ -94,3 +94,69 @@ clone_pinned() {
 	[[ "${got}" == "${commit}" ]] \
 		|| die "Checked out ${got} but expected the pinned ${commit} in ${dir}"
 }
+
+# ---------------------------------------------------------------------------
+# Reading partitions out of a built Armbian .img
+#
+# Factored out of make-burn-image.sh so make-nand-image.sh can reuse it.
+# ---------------------------------------------------------------------------
+
+SECTOR=512
+
+# "<start_lba> <sectors>" for partition $2 (1-based) of the image $1.
+#
+# The table is parsed here rather than shelled out to sfdisk/parted so the
+# scripts have no dependency beyond losetup and python3. Armbian writes a
+# plain MBR for this board.
+part_geometry() {
+	python3 - "$1" "$2" <<-'PY'
+		import struct, sys
+		img, want = sys.argv[1], int(sys.argv[2])
+		with open(img, 'rb') as f:
+		    mbr = f.read(512)
+		if len(mbr) < 512 or mbr[510:512] != b'\x55\xaa':
+		    sys.exit("not an MBR-partitioned image")
+		entries = []
+		for i in range(4):
+		    e = mbr[446 + i * 16: 446 + (i + 1) * 16]
+		    ptype = e[4]
+		    start, sectors = struct.unpack_from('<II', e, 8)
+		    if ptype != 0 and sectors:
+		        entries.append((start, sectors))
+		if len(entries) < want:
+		    sys.exit(f"image has {len(entries)} partition(s); wanted #{want}")
+		print("%d %d" % entries[want - 1])
+	PY
+}
+
+# Every loop device attached by attach_part, so a trap can release them.
+declare -a LOOPS=()
+release_loops() {
+	local l
+	for l in "${LOOPS[@]:-}"; do
+		[[ -n "${l}" ]] && losetup -d "${l}" 2>/dev/null || true
+	done
+	LOOPS=()
+}
+
+# Attach partition $2 of image $1 and set ATTACHED_LOOP to the device.
+#
+# Deliberately NOT "echo the device and capture it with $(...)": command
+# substitution runs in a subshell, so the LOOPS+=() inside would be lost and
+# the cleanup trap would have nothing to release -- the loop devices would
+# leak on every failure until the host runs out of them.
+#
+# Attaching each partition with an explicit offset and size also avoids
+# relying on `losetup --partscan` to spawn /dev/loopNpM nodes. Those nodes
+# are created by udev, which is frequently absent inside build containers.
+ATTACHED_LOOP=""
+attach_part() {
+	local img="$1" n="$2" geom start size
+	geom="$(part_geometry "${img}" "${n}")" \
+		|| die "Cannot read partition ${n} of ${img}: ${geom}"
+	start="${geom% *}"
+	size="${geom#* }"
+	ATTACHED_LOOP="$(losetup --find --show \
+		--offset "$((start * SECTOR))" --sizelimit "$((size * SECTOR))" "${img}")"
+	LOOPS+=("${ATTACHED_LOOP}")
+}

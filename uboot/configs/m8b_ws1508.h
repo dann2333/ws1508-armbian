@@ -235,7 +235,7 @@
 // =============================================================================
 #define CONFIG_PREBOOT				"run prepare_video; run check_usbburn; print 'Waiting for autoboot...'"
 #define CONFIG_BOOTDELAY			3
-#define CONFIG_BOOTCOMMAND			"print 'Autobooting...'; run boot_usb; run boot_sd; run boot_emmc; print 'Failed to boot'; "
+#define CONFIG_BOOTCOMMAND			"print 'Autobooting...'; run boot_usb; run boot_sd; run boot_emmc; run boot_nand; print 'Failed to boot'; "
 #define CONFIG_HOSTNAME				"ws1508"
 #define CONFIG_ETHADDR				00:15:18:01:81:31
 #define CONFIG_IPADDR				192.168.1.150
@@ -327,6 +327,63 @@
 		"print -n 'Try to boot from eMMC...'; " \
 		"mmc rescan 1; " \
 		"setenv bootdev 'mmc 1'; run boot_scr; " \
+		"print 'Fail'; " \
+		"\0" \
+	\
+	/* Kernel command line for a root filesystem on internal NAND.    */ \
+	/* Separate from the boot_nand logic so it can be edited with     */ \
+	/* setenv + saveenv on a unit that needs a different root, which  */ \
+	/* is the only way to change it: a NAND boot never reads          */ \
+	/* armbianEnv.txt, because there is no filesystem to read it from.*/ \
+	/*                                                                */ \
+	/* ubi.mtd names the partition rather than numbering it. UBI's    */ \
+	/* open_mtd_device() tries the argument as an integer first and   */ \
+	/* falls back to get_mtd_device_nm() (drivers/mtd/ubi/build.c),   */ \
+	/* so "ubi" resolves by label. Worth the two extra characters:    */ \
+	/* with a number, anything that shifts MTD numbering -- turning   */ \
+	/* CONFIG_MTD_PARTITIONED_MASTER on, adding a partition ahead of  */ \
+	/* it -- would silently attach UBI to the VENDOR region instead.  */ \
+	/* meson_nand.allow_write=1 is required or the MTD comes up       */ \
+	/* read-only and UBI attaches read-only with it rather than       */ \
+	/* failing, which looks like a working boot until the first write.*/ \
+	"nandargs=" \
+		"root=ubi0:rootfs rootfstype=ubifs ubi.mtd=ubi " \
+		"meson_nand.allow_write=1 rootwait rw " \
+		"console=tty1 console=ttyAML0,115200n8 " \
+		"no_console_suspend consoleblank=0" \
+		"\0" \
+	\
+	"loadaddr_kernel=0x16000000\0" \
+	\
+	/* Last resort, after USB, SD and eMMC have all failed to produce */ \
+	/* a boot.scr. This is the only path that can boot a raw-NAND     */ \
+	/* unit from its internal flash, and it deliberately does NOT go  */ \
+	/* through boot.scr: boot.scr is itself fatload'ed from a         */ \
+	/* filesystem, and CONFIG_NEXT_NAND leaves this bootloader with   */ \
+	/* no filesystem layer over NAND at all. So the whole NAND boot   */ \
+	/* lives here in the environment.                                 */ \
+	/*                                                                */ \
+	/* "imgread kernel boot ${addr}" reads an Android boot.img out of */ \
+	/* the "boot" NFTL partition, sizing the read from the header     */ \
+	/* (common/cmd_imgread.c:328). bootm then boots all three pieces  */ \
+	/* out of that one image: the kernel is a legacy uImage at        */ \
+	/* +0x800, the ramdisk comes from ramdisk_size, and the device    */ \
+	/* tree comes from second_size (common/cmd_bootm.c:294-320). So   */ \
+	/* one read and one bootm, with no offsets hard-coded here.       */ \
+	/*                                                                */ \
+	/* Gated on ${store} = 1 (raw NAND). On an eMMC unit "store read" */ \
+	/* silently becomes "mmc read" against the FAT boot partition and */ \
+	/* imgread would reject the result -- harmless, but there is no   */ \
+	/* reason to try. Nothing here writes or erases: "store init",    */ \
+	/* "store write" and "store erase" are all destructive on an eMMC */ \
+	/* unit and must never appear in a boot path.                     */ \
+	"boot_nand=" \
+		"print -n 'Try to boot from NAND...'; " \
+		"test \"${store}\" = \"1\" && " \
+			"setenv bootdev nand && " \
+			"setenv bootargs ${nandargs} ws1508.store=${store} && " \
+			"imgread kernel boot ${loadaddr_kernel} && " \
+			"bootm ${loadaddr_kernel}; " \
 		"print 'Fail'; " \
 		"\0" \
 	""

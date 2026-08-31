@@ -18,13 +18,16 @@
 # are exactly the names the bootloader's partition table declares (see
 # uboot/m8b_ws1508/firmware/storage.c).
 #
-# NOTE: writing boot+rootfs to internal storage only produces a bootable
-# system on eMMC units. Nothing here can root a raw-NAND unit off its
-# internal flash: the partitions this writes are the vendor bootloader's,
-# in a layout only its own NFTL understands, and neither u-boot nor Linux
-# has a filesystem on top of it. (Not a hardware limit - see README - but
-# it is not something this packer can paper over.) NAND users should flash
-# the bootloader-only package, ws1508-uboot.burn.img, and boot from USB.
+# NOTE: this packer is for eMMC units. What it writes is a FAT boot
+# partition and an ext4 root partition, and on a raw-NAND unit both would
+# go through the vendor NFTL, where Linux could never read them back --
+# and the rootfs one would land on the physical tail of the chip that a
+# NAND install gives to UBI.
+#
+# NAND units have their own package: scripts/make-nand-image.sh builds
+# ws1508-nand.burn.img (bootloader + an Android boot.img holding the
+# kernel), and the root filesystem is created on the box afterwards by
+# ws1508-install-to-nand. See docs/flashing.md.
 
 source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
@@ -52,64 +55,20 @@ cp -r "${BURN_BASE}" "${BURN}"
 
 log "Extracting partitions from $(basename "${DISKIMG}")"
 
-# Read the partition table and attach each partition as its own loop device
-# with an explicit offset and size, instead of relying on `losetup
-# --partscan` to spawn /dev/loopNpM nodes. Those nodes are created by udev,
-# which is frequently absent inside build containers -- and when it is, a
-# --partscan loop silently yields no partition devices at all.
-#
-# The table is parsed here rather than shelled out to sfdisk/parted so the
-# script has no dependency beyond losetup and python3. Armbian writes a
-# plain MBR for this board.
-part_geometry() { # -> "<start_lba> <sectors>" for partition $1 (1-based)
-	python3 - "${DISKIMG}" "$1" <<-'PY'
-		import struct, sys
-		img, want = sys.argv[1], int(sys.argv[2])
-		with open(img, 'rb') as f:
-		    mbr = f.read(512)
-		if len(mbr) < 512 or mbr[510:512] != b'\x55\xaa':
-		    sys.exit("not an MBR-partitioned image")
-		entries = []
-		for i in range(4):
-		    e = mbr[446 + i * 16: 446 + (i + 1) * 16]
-		    ptype = e[4]
-		    start, sectors = struct.unpack_from('<II', e, 8)
-		    if ptype != 0 and sectors:
-		        entries.append((start, sectors))
-		if len(entries) < want:
-		    sys.exit(f"image has {len(entries)} partition(s); wanted #{want}")
-		print("%d %d" % entries[want - 1])
-	PY
-}
-
-SECTOR=512
+# Attach each partition as its own loop device. The MBR parser and the
+# loop-device helpers live in common.sh, which documents why they avoid
+# `losetup --partscan`; make-nand-image.sh needs the same two.
 declare -a LOOPS=()
-cleanup() { for l in "${LOOPS[@]:-}"; do [[ -n "${l}" ]] && losetup -d "${l}" 2>/dev/null || true; done; }
-trap cleanup EXIT
+trap release_loops EXIT
 
-# Sets ATTACHED_LOOP. Deliberately NOT "echo the device and capture it with
-# $(...)": command substitution runs in a subshell, so the LOOPS+=() inside
-# would be lost and the cleanup trap would have nothing to release -- the
-# loop devices would leak on every failure until the host runs out of them.
-ATTACHED_LOOP=""
-attach_part() { # $1 = partition number
-	local n="$1" geom start size
-	geom="$(part_geometry "${n}")" || die "Cannot read partition ${n} of ${DISKIMG}: ${geom}"
-	start="${geom% *}"
-	size="${geom#* }"
-	ATTACHED_LOOP="$(losetup --find --show --offset "$((start * SECTOR))" --sizelimit "$((size * SECTOR))" "${DISKIMG}")"
-	LOOPS+=("${ATTACHED_LOOP}")
-}
-
-attach_part 1; BOOT_LOOP="${ATTACHED_LOOP}"
-attach_part 2; ROOT_LOOP="${ATTACHED_LOOP}"
+attach_part "${DISKIMG}" 1; BOOT_LOOP="${ATTACHED_LOOP}"
+attach_part "${DISKIMG}" 2; ROOT_LOOP="${ATTACHED_LOOP}"
 log "boot partition -> ${BOOT_LOOP}, root partition -> ${ROOT_LOOP}"
 
 img2simg "${BOOT_LOOP}" "${BURN}/boot.simg"
 img2simg "${ROOT_LOOP}" "${BURN}/rootfs.simg"
 
-cleanup
-LOOPS=()
+release_loops
 trap - EXIT
 
 printf 'sha1sum %s' "$(sha1sum "${BURN}/boot.simg"   | awk '{print $1}')" > "${BURN}/boot.VERIFY"

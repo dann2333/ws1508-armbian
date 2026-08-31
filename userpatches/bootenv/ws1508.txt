@@ -53,11 +53,23 @@ console="both"
 #       NAND unit there is nothing on them to lose. The SD card slot is
 #       a different controller (&sdio) and is NOT affected.
 #     - enables the S805 raw-NAND controller. IF the driver enumerates
-#       the fitted die you get /dev/mtd0. That "if" is real: this driver
-#       has never run on meson8b silicon, so nand_scan() failing
-#       outright, or reads of vendor-written pages coming back
+#       the fitted die you get two MTDs: /dev/mtd0 "vendor" (the first
+#       384MiB, read-only, holding the bootloader, its environment, the
+#       per-unit keys and the partitions the bootloader reads) and
+#       /dev/mtd1 "ubi" (the rest, which Linux owns). That "if" is real:
+#       this driver has never run on meson8b silicon, so nand_scan()
+#       failing outright, or reads of vendor-written pages coming back
 #       ECC-uncorrectable, are both expected possibilities rather than
 #       bugs to report as regressions.
+#
+#   You need this line to INSTALL to NAND -- 'ws1508-install-to-nand'
+#   needs /dev/mtd1 to exist -- but not to BOOT from NAND. A box that has
+#   already been installed gets its device tree out of the Android
+#   boot.img in the vendor "boot" partition, and never reads this file at
+#   all: there is no filesystem on NAND for the bootloader to read it
+#   from. Changing anything here after installing therefore only affects
+#   USB and eMMC boots. The NAND kernel command line lives in the u-boot
+#   environment instead, as ${nandargs}, editable with setenv/saveenv.
 #   What it does NOT do:
 #     - it does not let the box boot from internal storage. Not because
 #       the bootloader cannot read NAND -- it can, with

@@ -124,16 +124,25 @@ setenv bootargs "${bootargs} ws1508.store=${ws1508_store}"
 # over the vendor flash with a driver that has never been exercised on
 # this silicon, and nobody should get that without asking for it.
 #
-# It does not make the box boot from NAND either, but not for the reason
-# this comment used to give. This bootloader CAN read raw NAND: "store
-# read <name> <addr> <off> <size>" forwards to "amlnf read_byte" on a
-# NAND unit, which is how the vendor firmware boots. What it lacks is a
-# filesystem layer over NAND (CONFIG_NEXT_NAND drops libmtd.o/libnand.o),
-# so fatload cannot work there -- and this script has no store-read
-# branch. Every load below is a fatload from ${bootdev}. Booting from
-# internal NAND is unimplemented here, not impossible; it would need a
-# store-read variant of these three loads plus offsets that match the
-# vendor partition table, and a rootfs story Linux does not have yet.
+# Selecting the NAND dtb here is NOT what makes the box boot from NAND,
+# and this script is not where that happens at all. Booting from internal
+# NAND lives in the u-boot environment instead -- the boot_nand entry in
+# uboot/configs/m8b_ws1508.h, which CONFIG_BOOTCOMMAND runs after USB, SD
+# and eMMC have all failed.
+#
+# It has to live there because this script cannot reach that case: boot.scr
+# is itself fatload'ed from a filesystem, and CONFIG_NEXT_NAND leaves this
+# bootloader with no filesystem layer over NAND (it drops libmtd.o and
+# libnand.o). A NAND-only unit therefore never gets far enough to run these
+# lines. boot_nand does the whole thing in two commands instead: "imgread
+# kernel boot" pulls an Android boot.img out of the vendor partition, and
+# bootm takes the kernel, the ramdisk and the device tree out of that one
+# image.
+#
+# What selecting the NAND dtb here IS for: a unit that boots from USB and
+# wants /dev/mtd0 and /dev/mtd1 visible, which is what you need to install
+# to NAND in the first place (ws1508-install-to-nand) or to inspect the
+# flash (ws1508-nand-probe).
 #
 # Nothing but the user is expected to write this variable: Armbian
 # appends an fdtfile= line to armbianEnv.txt when the board config sets

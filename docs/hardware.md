@@ -155,14 +155,21 @@ cat /proc/cmdline | tr ' ' '\n' | grep ws1508.store
   在探测到 NAND 时转成 `amlnf read_byte`（`common/store_interface.c:293-311`），
   用法说明就写着「read 'size' bytes … skipping bad blocks」（`:938`）。
   厂商 3.10 固件就是靠这条路从内置 NAND 启动的。
-- 差的是**本项目没实现这条路**。`userpatches/bootscripts/boot-ws1508.cmd`
-  只会 `fatload ${bootdev} …`，没有 `store read` 分支；而且就算引导起来了，
-  内置闪存上是厂商的 NFTL 布局，主线 Linux 没有能挂上去的根文件系统方案。
+- 但 `store read` 走的是 **NFTL**（`aml_nftl_get_dev()` 按分区名查表，
+  `drivers/amlnf/dev/cmd_amlnf.c:304-328`），不是裸偏移。这一层只有
+  编译好的二进制（`drivers/amlnf/logic/libamlnf_logic_150311.z`），
+  所以 Linux 永远算不出它的逻辑→物理映射。**两边不能共用同一块区域。**
 
-所以：**从内置 NAND 启动在本项目里是「没做」，不是「做不到」。**
-谁想做，缺口就是上面两条——一个 `store read` 版的启动脚本（外加一份对得上的
-偏移表），和一个不动厂商保留区的根文件系统方案。在此之前，
-内核、initrd、dtb 一律来自 U 盘或 SD 卡。
+**从内置 NAND 启动现在实现了**，办法是按物理位置把芯片切开：厂商栈拿
+前 384MiB（引导页 + 元数据窗口 + 它要读的 NFTL 分区），Linux 拿剩下的
+做 UBI。引导程序用 `imgread kernel boot` 从厂商 `boot` 分区读一个
+Android boot.img，一条 `bootm` 就把内核、initrd、dtb 全取出来；
+Linux 则在 `/dev/mtd1` 上挂 UBIFS 根。整条路写在 U-Boot 环境变量
+`boot_nand` 里，不经过 `boot.scr`（`boot.scr` 自己就得从文件系统里读，
+纯 NAND 机器走不到）。
+
+细节见 README「NAND 版：从内置 NAND 启动」，装机步骤见
+[flashing.md](flashing.md)。**一次都没在实机上跑过。**
 
 内核这边**期望**给出的是一个 `/dev/mtd0`：把闪存**读**出来，仅此而已。
 写「期望」是因为这个驱动从来没在 meson8b 芯片上跑过 —— 见下面
@@ -427,7 +434,7 @@ amlnf chipinfo
 | 网口 | ✅ `dwmac-meson`，RMII 100M |
 | USB | ✅ `dwc2`，含 USB 存储 |
 | SD / eMMC | ✅ `meson-mx-sdio` / `meson-mx-sdhc` |
-| 裸 NAND | ⚠️ **实验性且未在实机验证**，本项目自带补丁把 meson8/meson8b 加进 `meson_nand.c`；默认关闭、默认只读。本项目**没有实现**从它启动的路径（引导端能读裸 NAND，缺的是启动脚本和根文件系统方案）。见上文「裸 NAND：能做什么、不能做什么」 |
+| 裸 NAND | ⚠️ **实验性且未在实机验证**，本项目自带补丁把 meson8/meson8b 加进 `meson_nand.c`；默认关闭、默认只读。从它启动的路径**已经实现**（引导端 `imgread kernel boot` 读 Android boot.img，Linux 侧 UBI/UBIFS 根），同样未在实机验证。见上文「裸 NAND：能做什么、不能做什么」 |
 | HDMI | — 内核有 `drm/meson`，但**这块板子没有视频输出**，用不上 |
 | 温度传感 | ⚠️ meson8b 支持有限 |
 | GPU (Mali-450) | ⚠️ lima 驱动，对这机器没什么意义 |

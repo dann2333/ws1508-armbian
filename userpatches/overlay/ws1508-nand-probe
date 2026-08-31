@@ -24,13 +24,28 @@
 # NAND -- "store read <name> <addr> <off> <size>" dispatches to the amlnf
 # driver, which is how the vendor 3.10 firmware boots -- but it has no
 # filesystem layer over the flash (CONFIG_NEXT_NAND drops libmtd.o and
-# libnand.o), our boot script only ever fatloads from usb/sd/mmc, and
-# Linux still has no way to root a filesystem on the vendor NFTL.
+# libnand.o), so there is nothing to fatload from it.
+#
+# Booting from internal NAND IS now implemented, by going around that
+# rather than through it: the bootloader reads an Android boot.img out of
+# the vendor "boot" partition with "imgread kernel boot" (see the boot_nand
+# entry in the u-boot environment), and Linux roots on a UBI volume in the
+# separate part of the chip the vendor stack does not manage. This script
+# stays a read-only diagnostic; ws1508-install-to-nand is the installer.
 
 set -euo pipefail
 
-MTD=/dev/mtd0
-SYS=/sys/class/mtd/mtd0
+# Which MTD to inspect. With the partitions node in meson8b-ws1508-nand.dts
+# mtd0 is the read-only "vendor" region and mtd1 is the UBI one, so the
+# default here is no longer "the whole chip" -- pass a number to look at
+# another partition. Every partition is backed by the same die, so the
+# geometry lines below read the same on all of them.
+MTD_NR="${1:-0}"
+case "${MTD_NR}" in
+	''|*[!0-9]*) printf 'Usage: %s [mtd-number]\n' "${0##*/}" >&2; exit 2 ;;
+esac
+MTD="/dev/mtd${MTD_NR}"
+SYS="/sys/class/mtd/mtd${MTD_NR}"
 
 die()  { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -114,10 +129,12 @@ grep -E "48600|meson-nand" /proc/interrupts || echo "  (no NFC interrupt registe
 
 info "MTD"
 if [ ! -e "${SYS}" ]; then
-	echo "  No mtd0. The controller did not finish nand_scan() - see dmesg above."
+	echo "  No mtd${MTD_NR}. The controller did not finish nand_scan() - see dmesg"
+	echo "  above, or pass a partition number that exists."
 	exit 1
 fi
 cat /proc/mtd
+echo "  (inspecting mtd${MTD_NR}: $(cat "${SYS}/name" 2>/dev/null || echo '?'))"
 for f in type name size erasesize writesize oobsize; do
 	[ -r "${SYS}/${f}" ] && printf '  %-11s %s\n' "${f}" "$(cat "${SYS}/${f}")"
 done

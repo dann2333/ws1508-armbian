@@ -14,24 +14,14 @@
 # Only works on eMMC units. This installer is not the place to change
 # that - see the note below for what a NAND unit can and cannot do.
 #
-# A raw-NAND unit running the NAND device tree is EXPECTED to get a
-# /dev/mtd0 from the kernel -- "expected" because that driver has never
-# run on meson8b silicon -- so it is tempting to think this script could
-# be taught to use it. It cannot, but the reason is narrower than the one
-# that used to be written here:
-#
-#   - u-boot has no filesystem layer over NAND: CONFIG_NEXT_NAND makes
-#     the Amlogic Makefile drop libmtd.o and libnand.o, so fatload cannot
-#     read a kernel out of a filesystem on the flash.
-#   - u-boot CAN read raw NAND partitions, via "store read" / "amlnf
-#     read" (common/store_interface.c). Vendor firmware boots that way.
-#   - This project has not implemented a store-read boot path:
-#     boot-ws1508.cmd only ever fatloads from usb/sd/mmc.
-#   - Linux has no way to root on the vendor NFTL layout either.
-#
-# So an internal-NAND install is unimplemented here, not impossible. It
-# is a boot-script plus rootfs project, not something this installer can
-# be extended into, and none of it has been tried on real hardware.
+# A raw-NAND unit has its own installer, ws1508-install-to-nand. Do not
+# try to extend this one to cover it: the two have almost nothing in
+# common. eMMC is a block device that u-boot and Linux both read the same
+# way, so this script can write a partition table, a FAT /boot and an
+# ext4 / and be done. NAND is split between two owners that cannot read
+# each other's data -- the vendor's closed NFTL below 384MiB, Linux's UBI
+# above it -- so installing means writing the kernel with one tool (the
+# USB Burning Tool) and the root filesystem with another (Linux).
 
 set -euo pipefail
 
@@ -48,14 +38,11 @@ info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 # ---------------------------------------------------------------------------
 # Checks
 # ---------------------------------------------------------------------------
-[ -b "${DEV}" ] || die "No ${DEV}. This looks like a raw-NAND WS1508. This
-project has no way to put a bootable root filesystem on that flash: u-boot
-has no filesystem layer over NAND (so it cannot fatload a kernel from it),
-and although it can read raw NAND with 'store read'/'amlnf read', nothing
-here implements a boot path that uses it -- nor does Linux have a rootfs
-for the vendor NFTL layout. Unimplemented, not impossible; see
-docs/hardware.md if you want to work on it.
-Keep running from USB. Run 'ws1508-info' to confirm which variant you have."
+[ -b "${DEV}" ] || die "No ${DEV}. This looks like a raw-NAND WS1508, which has its own
+installer: run 'ws1508-install-to-nand' instead. Read docs/flashing.md
+first -- it needs the kernel half flashed with the USB Burning Tool, and
+none of that path has ever run on real silicon.
+Run 'ws1508-info' to confirm which variant you have."
 
 ROOTSRC="$(findmnt -no SOURCE /)"
 case "${ROOTSRC}" in

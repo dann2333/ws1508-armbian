@@ -182,6 +182,12 @@ jobs:
       - name: Pack the direct-flash burn image
         run: sudo -E bash scripts/make-burn-image.sh
 
+      # The NAND kernel package. Must run before the image is compressed
+      # below, because it reads the kernel, initrd and dtb back out of the
+      # built .img's boot partition.
+      - name: Pack the NAND boot image
+        run: sudo -E bash scripts/make-nand-image.sh
+
       - name: Collect artifacts
         id: collect
         run: |
@@ -189,8 +195,15 @@ jobs:
           cd "${OUTDIR}"
 
           # The bootloader-only package belongs next to the images: it is
-          # what raw-NAND owners need.
+          # what raw-NAND owners need first.
           cp uboot/ws1508-uboot.burn.img images/ 2>/dev/null || true
+
+          # The NAND kernel package and the bare boot.img inside it. Both
+          # are useful: the .burn.img installs through the USB Burning
+          # Tool, the .andr is what you would write by hand from a u-boot
+          # prompt with "usb_update boot".
+          cp nand/ws1508-nand.burn.img images/ 2>/dev/null || true
+          cp nand/ws1508-nand-boot.andr images/ 2>/dev/null || true
 
           cd images
 

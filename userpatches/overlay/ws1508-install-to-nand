@@ -1,0 +1,269 @@
+#!/bin/bash
+#
+# Install the running WS1508 system onto the internal raw NAND.
+#
+# Boot the box from a USB stick, run this once, remove the stick.
+#
+# This writes ONLY the root filesystem. The kernel side -- uImage, initrd
+# and device tree -- lives in the vendor "boot" partition and has to be
+# installed with the USB Burning Tool (ws1508-nand.burn.img), because it is
+# reached through Amlogic's NFTL and Linux has no way to write that. See
+# docs/flashing.md.
+#
+# This script cannot verify that you did it, and does not pretend to: the
+# same NFTL that stops Linux writing that partition stops it reading one,
+# so there is nothing here to check against. If you install the rootfs and
+# skip the kernel, the symptom is a box that still boots from USB and says
+# "Try to boot from NAND...Fail" with the stick removed.
+#
+# WHY THE CHIP IS SPLIT THE WAY IT IS
+#
+# Two owners share the flash and cannot read each other's data:
+#
+#   /dev/mtd0  "vendor"  0 .. 384MiB, read-only. Mask-ROM boot pages, the
+#              48-block amlnf metadata window (BBT, u-boot environment,
+#              the per-unit nkey/nsec), and the NFTL partitions the
+#              bootloader reads. All of it is behind a page-level FTL that
+#              ships only as a binary blob, so Linux cannot interpret it.
+#   /dev/mtd1  "ubi"     384MiB .. end. Ours. UBI does the wear levelling
+#              and bad-block handling here, in a format Linux can read.
+#
+# The reason mtd1 is safe to write is specific and worth knowing: it falls
+# inside amlnf's "nfdata" device, and the NFTL blob's amlnf_logic_init()
+# skips nfdata when u-boot calls it with flag 0 -- which is what every
+# normal boot does. So no garbage collection or wear levelling from the
+# vendor side ever runs across it.
+#
+# NONE OF THIS HAS RUN ON REAL HARDWARE. The meson8b raw-NAND driver
+# underneath it has never been exercised on S805 silicon. Everything below
+# is a first attempt, and the recovery path is a USB stick.
+
+set -euo pipefail
+
+MTD_LABEL_VENDOR="vendor"
+MTD_LABEL_UBI="ubi"
+UBI_VOL="rootfs"
+
+die()  { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+
+[ "$(id -u)" -eq 0 ] || die "Run this as root."
+
+# ---------------------------------------------------------------------------
+# Checks
+# ---------------------------------------------------------------------------
+
+# Find the MTD numbers by label rather than assuming 0 and 1. They are only
+# 0 and 1 while CONFIG_MTD_PARTITIONED_MASTER stays off; if a future kernel
+# turns it on, a whole-chip master appears first and everything shifts.
+mtd_by_label() {
+	local want="$1" d n
+	for d in /sys/class/mtd/mtd[0-9]*; do
+		[ -r "${d}/name" ] || continue
+		case "${d}" in *ro) continue ;; esac
+		if [ "$(cat "${d}/name")" = "${want}" ]; then
+			n="${d##*/mtd}"
+			printf '%s' "${n}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+[ -d /sys/class/mtd ] || die "No MTD subsystem. Is the meson_nand driver loaded?"
+
+MTD_UBI_NR="$(mtd_by_label "${MTD_LABEL_UBI}")" || die "No MTD partition labelled '${MTD_LABEL_UBI}'.
+This box is not running meson8b-ws1508-nand.dtb, or the NAND driver did not
+attach. Set fdtfile=meson8b-ws1508-nand.dtb in /boot/armbianEnv.txt and
+reboot, then run 'ws1508-info' and check dmesg for the meson-nand attach
+line. On an eMMC unit there is no NAND at all and this script does not apply."
+
+MTD_VENDOR_NR="$(mtd_by_label "${MTD_LABEL_VENDOR}")" \
+	|| die "Found '${MTD_LABEL_UBI}' but no '${MTD_LABEL_VENDOR}' partition. The device tree
+does not match what this script expects; refusing to guess which region is safe."
+
+MTD="/dev/mtd${MTD_UBI_NR}"
+[ -c "${MTD}" ] || die "${MTD} does not exist."
+
+STORE="$(tr ' ' '\n' < /proc/cmdline | sed -n 's/^ws1508\.store=//p' | head -1)"
+[ "${STORE}" = "1" ] || die "The bootloader reports store=${STORE:-unknown}, not 1 (raw NAND).
+Refusing to write the internal flash of a box whose own bootloader did not
+find raw NAND. Run 'ws1508-info'."
+
+if ! tr ' ' '\n' < /proc/cmdline | grep -qx 'meson_nand\.allow_write=1'; then
+	die "The kernel was booted without meson_nand.allow_write=1, so every MTD on
+this chip is read-only and nothing here can work. Add it to the extraargs=
+line in /boot/armbianEnv.txt and reboot. Read what that turns off first:
+docs/hardware.md."
+fi
+
+ROOTSRC="$(findmnt -no SOURCE /)"
+case "${ROOTSRC}" in
+	ubi*|/dev/ubi*)
+		die "The running system is already on UBI. Boot from USB to reinstall." ;;
+esac
+
+for t in ubiformat ubiattach ubidetach ubimkvol rsync; do
+	command -v "$t" >/dev/null 2>&1 \
+		|| die "Missing required tool: $t (apt-get install mtd-utils rsync)"
+done
+
+for m in ubi ubifs; do
+	modprobe "$m" 2>/dev/null || true
+done
+[ -d /sys/class/ubi ] || die "The 'ubi' module did not load. A UBIFS root also needs it in
+the initramfs; see /etc/initramfs-tools/modules."
+
+MTD_SIZE=$(( $(cat "/sys/class/mtd/mtd${MTD_UBI_NR}/size") ))
+MTD_EB=$(( $(cat "/sys/class/mtd/mtd${MTD_UBI_NR}/erasesize") ))
+MTD_PAGE=$(( $(cat "/sys/class/mtd/mtd${MTD_UBI_NR}/writesize") ))
+MTD_MIB=$(( MTD_SIZE / 1024 / 1024 ))
+
+# UBI overhead: 2 PEBs for the volume table, a handful reserved for bad-block
+# handling, plus 2 pages per PEB for the EC and VID headers (this driver has
+# no subpage writes, so each header costs a whole page).
+USED_MIB=$(( $(df --output=used -BM / | tail -1 | tr -dc '0-9') ))
+AVAIL_MIB=$(( MTD_MIB - MTD_MIB / 50 - 8 ))
+[ "${AVAIL_MIB}" -gt $((USED_MIB + 128)) ] \
+	|| die "Root filesystem uses ${USED_MIB}MiB but only about ${AVAIL_MIB}MiB would be
+available on ${MTD} after UBI overhead."
+
+cat <<EOF
+
+  This will ERASE ${MTD} ("${MTD_LABEL_UBI}", ${MTD_MIB}MiB of internal NAND)
+  and copy the running system onto it as a UBIFS volume.
+
+    erase block   ${MTD_EB} bytes
+    page          ${MTD_PAGE} bytes
+    UBI volume    ${UBI_VOL}, roughly ${AVAIL_MIB}MiB usable
+
+  /dev/mtd${MTD_VENDOR_NR} ("${MTD_LABEL_VENDOR}") is read-only and is NOT touched. That is where
+  the bootloader, its environment and the per-unit vendor keys live.
+
+  Currently running from: ${ROOTSRC}
+  Root filesystem in use: ${USED_MIB}MiB
+
+  This driver has never run on real S805 silicon. If it goes wrong the box
+  still boots from USB, because u-boot tries USB before NAND.
+
+EOF
+read -r -p "  Type YES to continue: " answer
+[ "${answer}" = "YES" ] || die "Aborted."
+
+# ---------------------------------------------------------------------------
+# Format
+# ---------------------------------------------------------------------------
+info "Detaching any existing UBI on ${MTD}"
+ubidetach -m "${MTD_UBI_NR}" 2>/dev/null || true
+
+# ubiformat keeps existing erase counters where it can, which is what we want
+# on a chip that has already been written by the vendor firmware. -y because
+# the confirmation above was the confirmation.
+info "Formatting ${MTD} for UBI (this erases it)"
+ubiformat "${MTD}" -y -q
+
+info "Attaching UBI"
+ubiattach -m "${MTD_UBI_NR}"
+
+UBI_DEV=""
+for d in /sys/class/ubi/ubi[0-9]*; do
+	[ -r "${d}/mtd_num" ] || continue
+	if [ "$(cat "${d}/mtd_num")" = "${MTD_UBI_NR}" ]; then
+		UBI_DEV="${d##*/}"
+		break
+	fi
+done
+[ -n "${UBI_DEV}" ] || die "UBI attached but no ubi device maps back to mtd${MTD_UBI_NR}."
+
+info "Creating volume '${UBI_VOL}' on ${UBI_DEV}"
+ubimkvol "/dev/${UBI_DEV}" -N "${UBI_VOL}" -m
+
+# ubimkvol picks the id; ask which one it chose rather than assuming 0.
+VOL_ID=""
+for v in /sys/class/ubi/${UBI_DEV}/${UBI_DEV}_[0-9]*; do
+	[ -r "${v}/name" ] || continue
+	if [ "$(cat "${v}/name")" = "${UBI_VOL}" ]; then
+		VOL_ID="${v##*_}"
+		break
+	fi
+done
+[ -n "${VOL_ID}" ] || die "Created volume '${UBI_VOL}' but cannot find it under /sys/class/ubi."
+VOL_DEV="/dev/${UBI_DEV}_${VOL_ID}"
+[ -c "${VOL_DEV}" ] || die "No ${VOL_DEV} after ubimkvol."
+
+# ---------------------------------------------------------------------------
+# Copy
+# ---------------------------------------------------------------------------
+TARGET="$(mktemp -d /tmp/ws1508-nand.XXXXXX)"
+cleanup() {
+	mountpoint -q "${TARGET}" && umount "${TARGET}" || true
+	rmdir "${TARGET}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+info "Mounting ${VOL_DEV} on ${TARGET}"
+mount -t ubifs "${VOL_DEV}" "${TARGET}"
+
+info "Copying the running system (this takes a while)"
+rsync -aHAXx --info=progress2 \
+	--exclude='/dev/*' --exclude='/proc/*' --exclude='/sys/*' \
+	--exclude='/tmp/*' --exclude='/run/*' --exclude='/mnt/*' \
+	--exclude='/media/*' --exclude='/lost+found' \
+	--exclude="${TARGET}" \
+	/ "${TARGET}/"
+
+# ---------------------------------------------------------------------------
+# Fix up the copy
+# ---------------------------------------------------------------------------
+info "Adjusting the installed system"
+
+# root= comes from the bootloader's ${nandargs}, not from fstab, and /boot
+# is inside the NAND boot.img rather than a mountable filesystem. So fstab
+# gets neither -- a stale entry for the USB stick's partitions would hang
+# the boot on a device that is no longer there.
+cat > "${TARGET}/etc/fstab" <<-EOF
+	# Root is a UBIFS volume; the bootloader passes root=ubi0:${UBI_VOL}
+	# on the kernel command line. There is no separate /boot filesystem on
+	# a NAND install: the kernel, initrd and device tree live in an Android
+	# boot.img in the vendor "boot" partition, which only the bootloader
+	# can read. Update them with the USB Burning Tool, not with apt.
+	ubi0:${UBI_VOL}  /  ubifs  defaults,noatime  0 0
+	tmpfs            /tmp  tmpfs  defaults,nosuid  0 0
+EOF
+
+# The modules a UBIFS root needs before it can mount anything.
+mkdir -p "${TARGET}/etc/initramfs-tools"
+for m in meson_nand ubi ubifs; do
+	grep -qxF "${m}" "${TARGET}/etc/initramfs-tools/modules" 2>/dev/null \
+		|| echo "${m}" >> "${TARGET}/etc/initramfs-tools/modules"
+done
+
+# Armbian's own resize-on-first-boot would try to grow a partition that does
+# not exist here.
+rm -f "${TARGET}/root/.rootfs_resize" \
+      "${TARGET}/etc/systemd/system/multi-user.target.wants/armbian-resize-filesystem.service" \
+      2>/dev/null || true
+
+sync
+info "Unmounting"
+umount "${TARGET}"
+trap - EXIT
+cleanup
+
+cat <<EOF
+
+  Done.
+
+  The root filesystem is installed. For the box to boot from NAND you also
+  need the kernel side in the vendor "boot" partition -- that is
+  ws1508-nand.burn.img, flashed with the USB Burning Tool. If you have not
+  done that yet, do it now; this script cannot do it, because that
+  partition is behind Amlogic's NFTL and only the bootloader can write it.
+
+  Then: shut down, REMOVE THE USB STICK, power on.
+
+  u-boot tries USB, then SD, then eMMC, then NAND -- so leaving the stick
+  in keeps booting from the stick, and it is also how you get back in if
+  the NAND boot does not work.
+
+EOF

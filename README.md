@@ -5,11 +5,13 @@
 由 GitHub Actions 全自动编译，**开机自启 SSH**。
 
 - **eMMC 版机器**：可以直刷内置存储，拔掉 U 盘照样开机。
-- **NAND 版机器**：可以直刷引导（U-Boot），系统跑在 U 盘/SD 卡上。
+- **NAND 版机器**：可以直刷引导（U-Boot），也可以把整个系统装进内置 NAND
+  —— 但那条路一次都没在实机上验证过，见下面「NAND 版：从内置 NAND 启动」。
 
 > WS1508 同时存在 **NAND** 和 **eMMC** 两种版本（连同一块 v1.1 主板都有两种），
-> 本项目对两种都做了适配，但**能做到的程度不一样**，
-> 原因见下面「NAND 版：为什么现在还不能从内置存储启动」。
+> 本项目对两种都做了适配。eMMC 那条路是常规做法；
+> NAND 那条路要绕开一个没有源码的厂商 FTL，
+> 见下面「NAND 版：从内置 NAND 启动」。
 
 ---
 
@@ -95,48 +97,87 @@ ssh root@<设备IP>        # 也可以试 ssh root@ws1508.local
 
 ---
 
-## NAND 版：为什么现在还不能从内置存储启动
+## NAND 版：从内置 NAND 启动
 
-这一节以前写错过，现在按代码重写。要分开的是两件常被混在一起的事：
-**引导程序读不读得到 NAND**，和**本项目有没有实现从 NAND 启动**。
+**已经实现了，但一次都没在实机上跑过。** 这一节讲它是怎么做到的，
+因为要用它就得知道它靠什么假设成立。
 
-### 引导程序读得到 NAND
+### 关键事实：这颗芯片有两个互相读不懂对方的主人
 
-本项目的 U-Boot 开了 `CONFIG_NEXT_NAND`（`uboot/configs/m8b_ws1508.h:153`），
-这个宏同时做了两件方向相反的事：
+厂商的 `amlnf` 栈用的是一层页级 FTL（NFTL），做磨损均衡和坏块重映射，
+映射表存在页的 OOB 里。而这一层**只有编译好的二进制**
+（`drivers/amlnf/logic/libamlnf_logic_150311.z`，一个 ARM ELF 目标文件），
+没有源码。所以「逻辑偏移」和「物理偏移」不是一回事，
+Linux 永远没法复现这个映射。
 
-- 它把 `drivers/mtd/libmtd.o` 和 `drivers/mtd/nand/libnand.o` 从构建里踢掉
-  （厂商 U-Boot `Makefile:216-226`）。所以引导程序里**没有文件系统层**，
-  `fatload` 不可能从 NAND 上的某个文件系统里读出 uImage；
-- 但同一个宏又把 `common/store_interface.o` 编了进去
-  （`common/Makefile:173-176`）。`store read <名字> <内存地址> <偏移> <长度>`
-  在 `device_boot_flag` 是 NAND 时会转成 `amlnf read_byte` 下去
-  （`common/store_interface.c:293-311`），命令自带的用法说明写的就是
-  「read 'size' bytes … skipping bad blocks」（同文件 `:938`）。
-  `amlnf read` / `amlnf chipinfo` 也都在（`drivers/amlnf/dev/cmd_amlnf.c`）。
+结论：**不能让两边共享同一块区域**。于是按物理位置把芯片切成两半：
 
-也就是说：**按裸偏移读 NAND，引导程序做得到**——厂商 3.10 固件正是这么从
-内置 NAND 启动的。缺的是文件系统那一层，不是读闪存的能力。
+| 物理范围 | 归谁 | 内容 |
+|---|---|---|
+| 0 – 384MiB | 厂商 `amlnf` | 掩膜 ROM 读的 1024 个启动页；48 个好块的元数据窗口（坏块表、U-Boot 环境、一机一份的 `nkey`/`nsec`）；引导程序要读的 NFTL 分区 |
+| 384MiB – 末尾 | Linux | UBI，上面一个 UBIFS 卷做根文件系统 |
 
-### 缺口在本项目这一侧：没做，不是做不了
+384MiB 这个边界不是拍脑袋：启动页占 2MiB，元数据窗口 6MiB，
+`nfcode`（`resource` 4MiB + `boot` 256MiB，NFTL 还要多留 1/8）约 292MiB，
+加起来约 300MiB。384 是留足坏块余量后取整。4GiB 的芯片上这点浪费换的是
+唯一一类改不回来的错误不会发生。
 
-1. **没有走 `store read` 的启动路径。**
-   `userpatches/bootscripts/boot-ws1508.cmd` 从头到尾只有
-   `fatload ${bootdev} …`，只认 usb / sd / mmc。要从内置 NAND 引导，
-   得另写一个用 `store read` 把 uImage / uInitrd / dtb 从裸偏移读进内存
-   再 `bootm` 的启动脚本，还得有一份和厂商分区表对得上的偏移。
-   本仓库没有这个东西，也没有在实机上试过。
-2. **根文件系统没有着落。**
-   内置闪存上是厂商的 NFTL 布局，主线 Linux 没有能挂上去的驱动。
-   想在上面放 UBI 就得动厂商保留区，而那块区域丢了补不回来（见下文）。
-   理论上还可以整个塞进 initramfs 全内存跑，但这机器只有 512MB，
-   那是另一个问题了。
+**Linux 那一半为什么是安全的**：它落在 `amlnf` 的 `nfdata` 设备里，
+而 NFTL 那个 blob 的 `amlnf_logic_init()` 在 flag=0 时会跳过 `nfdata` ——
+每次正常启动 U-Boot 都正是这么调的（`arch/arm/lib/board.c:750`）。
+所以厂商那边的垃圾回收和磨损均衡从来不会碰这块地方。
 
-所以准确的说法是：**这条路本项目没有实现、也没有验证过**，
-而不是引导那一端原理上读不到 NAND。想接着做的人，上面两条就是入口。
+### 启动怎么走
 
-现在能做到的是：把 U-Boot 刷进 NAND（U-Boot 自己带 Amlogic 的 `amlnf` 驱动，
-读写 NAND 没问题），然后由它去 U 盘/SD 卡上把系统引导起来。
+不经过 `boot.scr`。`boot.scr` 自己就是 `fatload` 出来的，而 NAND 上没有
+文件系统可读，纯 NAND 的机器根本走不到那一步。所以整条路放在 U-Boot
+环境变量里，`CONFIG_BOOTCOMMAND` 在 USB / SD / eMMC 都失败之后才跑它：
+
+```
+imgread kernel boot 0x16000000 && bootm 0x16000000
+```
+
+`imgread kernel` 从厂商 `boot` 分区里读一个 **Android boot.img**，
+读多少由镜像头自己说了算（`common/cmd_imgread.c:328`）。
+然后一条 `bootm` 把三样东西全从这一个镜像里取出来
+（`common/cmd_bootm.c:294-320`）：
+
+- **内核**：`+0x800` 处的 legacy uImage（`bootm` 这个 `0x800` 是写死的，
+  所以页大小必须正好 2048）
+- **initrd**：按 `ramdisk_size` 原样交给内核 —— 所以这一格放的是**裸的
+  `initrd.img`**，不是 mkimage 包过的 `uInitrd`
+- **设备树**：按 `second_size` 取，经过 `get_multi_dt_entry()`，
+  普通 dtb 原样返回（`common/aml_dt.c:29-32`）
+
+这个 boot.img 由 `scripts/make-nand-image.sh` 生成，
+头是自己写的，不依赖 `mkbootimg`。
+
+### 装机步骤
+
+见 [docs/flashing.md](docs/flashing.md)。两半分开装，因为**内核那一半
+Linux 写不了**（在 NFTL 后面），根文件系统那一半又只有 Linux 能写：
+
+1. 用 USB 烧录工具刷 `ws1508-nand.burn.img`（引导程序 + 内核）。
+   第一次刷**必须勾上「擦除 flash」**，因为分区表变了 —— 代价是
+   `nkey`/`nsec` 永久丢失，先读 docs/flashing.md 里那一段。
+2. 从 U 盘启动，`armbianEnv.txt` 里加 `fdtfile=meson8b-ws1508-nand.dtb`
+   和 `extraargs=meson_nand.allow_write=1`，重启。
+3. 跑 `ws1508-install-to-nand`，它把根文件系统写成 UBI 卷。
+4. 关机、**拔掉 U 盘**、开机。
+
+拔 U 盘这一步不是可选的：U-Boot 的顺序是 USB → SD → eMMC → NAND，
+插着 U 盘就一直从 U 盘启动。反过来说，这也就是出了问题时的退路。
+
+### 还没验证的地方
+
+整条路都没在实机上跑过，其中这几条是硬前提，只有实机能确认：
+
+- 那颗料必须是 **SLC**。UBI 拒绝挂 `MTD_MLCNANDFLASH`
+  （`drivers/mtd/ubi/build.c:898`）。
+- 页大小必须 **≤ 4096**，否则驱动直接不 attach。
+- 驱动的 ECC/加扰设置得真能读回厂商写过的页。
+
+`ws1508-nand-probe` 打印的就是这几项。
 
 ### 内核这边：有一个实验性的只读驱动
 

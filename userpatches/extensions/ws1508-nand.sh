@@ -40,6 +40,13 @@ function custom_kernel_config__ws1508_nand() {
 		"MTD_RAW_NAND=y"
 		"MTD_NAND_MESON=m"
 		"MTD_PARTITIONED_MASTER=n"
+		"MTD_UBI=m"
+		"MTD_UBI_BLOCK=y"
+		"UBIFS_FS=m"
+		"UBIFS_FS_ADVANCED_COMPR=y"
+		"UBIFS_FS_LZO=y"
+		"UBIFS_FS_ZLIB=y"
+		"UBIFS_FS_ZSTD=y"
 	)
 	# Announced as the real symbols, so the debug kernel and the normal one
 	# cannot share a cached artifact and the announcement names something
@@ -60,13 +67,15 @@ function custom_kernel_config__ws1508_nand() {
 	# rather than something you have to reason about.
 	kernel_config_set_m MTD_NAND_MESON
 
-	# Forward-looking hygiene, not a guarantee that holds today.
-	# CONFIG_MTD_PARTITIONED_MASTER=n only suppresses the whole-chip
-	# master device once a partitions node exists. meson8b-ws1508-nand.dts
-	# deliberately declares none, so right now /dev/mtd0 IS the whole
-	# unpartitioned chip and the only thing keeping a write off the
-	# bootloader is the driver's address guard. This symbol matters the
-	# day somebody adds partitions.
+	# meson8b-ws1508-nand.dts now declares a partitions node, so this
+	# symbol does what it was put here for: with it off there is no
+	# whole-chip master device, and the only MTDs are the two partitions
+	# -- /dev/mtd0 "vendor" (read-only) and /dev/mtd1 "ubi".
+	#
+	# Nothing depends on that numbering, deliberately: the bootloader
+	# says ubi.mtd=ubi and ws1508-install-to-nand looks partitions up by
+	# label. So turning this back on would waste a device node but would
+	# not misdirect UBI at the vendor region.
 	kernel_config_set_n MTD_PARTITIONED_MASTER
 
 	if [[ "${slub_debug}" == "yes" ]]; then
@@ -74,24 +83,52 @@ function custom_kernel_config__ws1508_nand() {
 		kernel_config_set_y SLUB_DEBUG_ON
 	fi
 
-	# Deliberately NOT enabled: MTD_UBI, MTD_UBI_BLOCK, UBIFS_FS and
-	# MTD_BLOCK. That keeps the kernel from mounting anything on this
-	# flash, which is the point at stage 1.
+	# UBI/UBIFS: the root filesystem for a unit booting from internal
+	# NAND. UBI is what makes raw NAND usable as a rootfs medium at all
+	# -- it does the wear levelling and bad-block handling that the
+	# vendor's closed NFTL blob does on its side of the chip, except in
+	# a format Linux can actually read.
 	#
-	# It is NOT a defence against a user erasing the chip, and nothing
-	# here should be read as one. userpatches/customize-image.sh installs
-	# mtd-utils into every image, Debian's mtd-utils is the combined
-	# package, and flash_erase / nandwrite / nandtest / ubiformat all work
-	# straight through /dev/mtdN with MEMERASE and MEMWRITE ioctls and
-	# need no UBI or mtdblock support in the kernel at all. So the
-	# barriers that actually exist are the two in the driver:
+	# Modules, not built-in, for the same reason MTD_NAND_MESON is: an
+	# eMMC image should not carry this code resident. The initramfs
+	# carries meson_nand, ubi and ubifs instead (see
+	# userpatches/customize-image.sh), which is what a UBIFS root needs.
 	#
-	#   - the MTD is read-only unless meson_nand.allow_write=1, and
+	# MTD_UBI_BLOCK is =y because it is a bool, not a tristate; it costs
+	# nothing without MTD_UBI loaded and gives a read-only block device
+	# over a UBI volume, which is the escape hatch if a squashfs root is
+	# ever preferred over UBIFS.
+	kernel_config_set_m MTD_UBI
+	kernel_config_set_y MTD_UBI_BLOCK
+	kernel_config_set_m UBIFS_FS
+	kernel_config_set_y UBIFS_FS_ADVANCED_COMPR
+	kernel_config_set_y UBIFS_FS_LZO
+	kernel_config_set_y UBIFS_FS_ZLIB
+	kernel_config_set_y UBIFS_FS_ZSTD
+
+	if [[ "${slub_debug}" == "yes" ]]; then
+		kernel_config_set_y SLUB_DEBUG
+		kernel_config_set_y SLUB_DEBUG_ON
+	fi
+
+	# Still NOT enabled: MTD_BLOCK. mtdblock over raw NAND has no
+	# bad-block handling at all, so it is a trap rather than a fallback.
+	# Everything here goes through UBI.
+	#
+	# None of this is a defence against a user erasing the chip, and
+	# nothing here should be read as one. userpatches/customize-image.sh
+	# installs mtd-utils into every image and flash_erase / nandwrite /
+	# nandtest / ubiformat all work straight through /dev/mtdN with
+	# MEMERASE and MEMWRITE ioctls. The barriers that actually exist are:
+	#
+	#   - /dev/mtd0 "vendor" is read-only in the device tree, covering
+	#     the whole 384MiB the vendor stack owns,
+	#   - the MTD is read-only altogether unless meson_nand.allow_write=1,
+	#     and
 	#   - erase, program, OOB write and mark-bad are refused below the
-	#     vendor boot region whatever allow_write says -- including the
+	#     driver's own guard whatever allow_write says -- including the
 	#     MEMSETBADBLOCK path, which erases the block before marking it
 	#     and which "nandtest --markbad" issues after a refused erase.
 	#
-	# Turn UBI on only after the ECC, scrambler and bad-block behaviour
-	# have been checked against a real unit.
+	# The write path has still never been exercised on real silicon.
 }
