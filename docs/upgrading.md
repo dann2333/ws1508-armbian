@@ -130,6 +130,9 @@ apt list -a linux-image-current-meson        # 看看有哪些版本
 sudo apt install --allow-downgrades linux-image-current-meson=<版本> linux-dtb-current-meson=<版本>
 ```
 
+改过地址的源文件，之后升级板级包时不会被改回去。想回到「跟最新版」，
+运行 `sudo ws1508-apt-setup enable` 即可。
+
 **不想再收更新：** `sudo ws1508-apt-setup disable` 只删掉源，pin 保留 ——
 pin 是防止官方内核被装上的，任何时候都应该留着。
 

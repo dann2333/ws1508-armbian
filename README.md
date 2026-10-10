@@ -287,6 +287,10 @@ docs/
 - hzyitc —— 最早的玩客云主线移植与 `meson8b-ws1508.dts` 原始作者
 - [lunatickochiya/Matrix-Action-Openwrt](https://github.com/lunatickochiya/Matrix-Action-Openwrt)
   —— WS1508 的 OpenWrt 移植与设备树
+- [@SoraKasvgano](https://github.com/SoraKasvgano)（[#2](../../issues/2)）——
+  第一份真实 WS1508 NAND 版的数据，查出了内核对海力士 H27UBG8T2C 的误识别
+- [@eloirotava](https://github.com/eloirotava)（[#1](../../issues/1)）——
+  在另一台 S805 上实测了本项目的 NAND 驱动
 - 恩山无线论坛与各位折腾赚钱宝的网友
 
 ## 许可

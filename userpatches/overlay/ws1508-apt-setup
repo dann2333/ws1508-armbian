@@ -30,7 +30,8 @@
 #   ws1508-apt-setup enable       write the pin and the source, nothing else
 #   ws1508-apt-setup pin          write the pin only
 #   ws1508-apt-setup disable      remove the source; the pin stays
-#   ws1508-apt-setup refresh      rewrite the source if it is enabled
+#   ws1508-apt-setup refresh      rewrite the source if it is enabled and
+#                                 still points at the default URL
 #   ws1508-apt-setup print-pin    print the pin file to stdout
 #   ws1508-apt-setup print-source print the source file to stdout
 #
@@ -107,7 +108,7 @@ need_root() {
 check_board() {
 	local board="" model=""
 	[ -r /etc/armbian-release ] && board="$(sed -n 's/^BOARD=//p' /etc/armbian-release | head -1)"
-	model="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)"
+	model="$( (tr -d '\0' < /proc/device-tree/model) 2>/dev/null || true)"
 	case "${board},${model}" in
 		ws1508,*|*,*WS1508*) return 0 ;;
 	esac
@@ -146,9 +147,15 @@ do_disable() {
 	info "Armbian's own kernel packages, which cannot boot this box, from being installed."
 }
 
+# Bring an enabled source up to the current format. Only one still pointing
+# at the default "latest" URL: a source the owner has pointed at a specific
+# release (to roll back, see docs/upgrading.md) or at a mirror is theirs.
 do_refresh() {
+	local uris
 	need_root
-	if [ -f "${SOURCE_FILE}" ]; then
+	[ -f "${SOURCE_FILE}" ] || return 0
+	uris="$(sed -n 's/^URIs:[[:space:]]*//p' "${SOURCE_FILE}" | head -1)"
+	if [ -z "${uris}" ] || [ "${uris}" = "${REPO_URL}" ]; then
 		write_file print_source "${SOURCE_FILE}"
 	fi
 }
@@ -163,8 +170,20 @@ do_full() {
 
 	info "Refreshing package lists"
 	if ! apt-get update; then
-		die "apt-get update failed. The channel is configured; check the network and
-run 'apt update' again. Nothing has been upgraded."
+		warn "apt-get update reported errors (above); carrying on if this channel's index arrived."
+	fi
+	# apt-get update's exit status says little about this channel: it is 0
+	# when a source merely cannot be reached -- github.com from some
+	# networks being the common case -- and non-zero for a broken source
+	# that has nothing to do with this one. What matters is whether the
+	# channel's index is there; without it there is nothing to upgrade to,
+	# so say so rather than run an upgrade that quietly does nothing.
+	local lists_prefix
+	lists_prefix="$(printf '%s' "${REPO_URL#*://}" | tr '/' '_')"
+	if ! compgen -G "/var/lib/apt/lists/${lists_prefix}*Packages*" > /dev/null; then
+		die "The update channel could not be reached (no index from ${REPO_URL}).
+The pin and the source are in place; run 'apt update' again when github.com is
+reachable, then 'apt full-upgrade'. Nothing has been upgraded."
 	fi
 
 	mapfile -t pkgs < <(installed_ws1508_packages)
@@ -178,25 +197,39 @@ run 'apt update' again. Nothing has been upgraded."
 	echo "  WS1508 packages on this box, and what the channel offers:"
 	echo
 	local p inst cand
+	local -A before=()
 	for p in "${pkgs[@]}"; do
 		inst="$(dpkg-query -W -f '${Version}' "${p}" 2>/dev/null || echo '?')"
 		cand="$(apt-cache policy "${p}" 2>/dev/null | sed -n 's/^ *Candidate: *//p' | head -1)"
+		before["${p}"]="${inst}"
 		printf '    %-34s %s  ->  %s\n' "${p}" "${inst}" "${cand:-?}"
 	done
 	echo
 
 	local -a apt_args=(install --only-upgrade)
 	if [ "${yes}" = yes ]; then
-		apt_args+=(-y)
+		# Unattended: keep any configuration file the owner has changed
+		# rather than stopping to ask, and take the new one otherwise.
+		apt_args+=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
 	fi
 	info "Upgrading the WS1508 packages"
-	apt-get "${apt_args[@]}" "${pkgs[@]}"
+	if ! apt-get "${apt_args[@]}" "${pkgs[@]}"; then
+		die "The upgrade did not complete (see apt's messages above). The pin and the
+source stay in place; once the cause is fixed, 'apt full-upgrade' finishes it."
+	fi
 
+	# Armbian's kernel packages leave no reboot-required flag behind, so
+	# compare versions instead.
+	local changed=no
+	for p in "${pkgs[@]}"; do
+		inst="$(dpkg-query -W -f '${Version}' "${p}" 2>/dev/null || echo '?')"
+		[ "${inst}" = "${before[${p}]}" ] || changed=yes
+	done
 	echo
-	if [ -e /var/run/.reboot_required ] || [ -e /var/run/reboot-required ]; then
+	if [ "${changed}" = yes ]; then
 		info "Done. Reboot to run the new kernel:  reboot"
 	else
-		info "Done."
+		info "Done; everything was already at the channel's version."
 	fi
 	echo "  From now on, 'apt update && apt full-upgrade' keeps this box current,"
 	echo "  WS1508 kernel included. Nothing needs reflashing for that."
