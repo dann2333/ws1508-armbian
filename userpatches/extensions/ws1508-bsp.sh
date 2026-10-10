@@ -68,6 +68,15 @@ function ws1508_bsp_postinst() {
 	unset ws1508_tool ws1508_old
 }
 
+# KEEP_ORIGINAL_OS_RELEASE=yes in the board config is there only to take
+# "base-files (>= REVISION)" out of the BSP's dependencies (see ws1508.conf).
+# Its other effect is that Armbian skips installing its own base-files, so
+# install it here, at the start of the same function that would have.
+function pre_install_distribution_specific__ws1508_armbian_base_files() {
+	display_alert "Installing Armbian's base-files" "KEEP_ORIGINAL_OS_RELEASE is set for the BSP's sake only" "info"
+	install_artifact_deb_chroot "armbian-base-files" "--allow-downgrades"
+}
+
 function post_post_debootstrap_tweaks__ws1508_enable_update_channel() {
 	display_alert "Enabling the WS1508 update channel in the image" "${BOARD}" "info"
 	install -d -m 0755 "${SDCARD}/etc/apt/sources.list.d"

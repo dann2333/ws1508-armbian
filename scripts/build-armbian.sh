@@ -19,11 +19,21 @@ ARMBIAN_SRC="${WORKDIR}/armbian-build"
 
 mkdir -p "${WORKDIR}" "${OUTDIR}"
 
+# A full commit hash is checked out exactly (clone_pinned); anything else is
+# taken as a branch or tag name. There is deliberately no fallback to the
+# default branch when the ref does not exist: an earlier version had one, and
+# a mistyped ref then built whatever upstream happened to be at that day.
 if [[ ! -d "${ARMBIAN_SRC}/.git" ]]; then
-	log "Cloning ${ARMBIAN_REPO} @ ${ARMBIAN_REF}"
-	git clone --depth 1 --branch "${ARMBIAN_REF}" "${ARMBIAN_REPO}" "${ARMBIAN_SRC}" 2>/dev/null \
-		|| git clone --depth 1 "${ARMBIAN_REPO}" "${ARMBIAN_SRC}"
+	if [[ "${ARMBIAN_REF}" =~ ^[0-9a-f]{40}$ ]]; then
+		clone_pinned "${ARMBIAN_REPO}" "${ARMBIAN_REF}" "${ARMBIAN_SRC}"
+	else
+		log "Cloning ${ARMBIAN_REPO} @ ${ARMBIAN_REF}"
+		git clone --depth 1 --branch "${ARMBIAN_REF}" "${ARMBIAN_REPO}" "${ARMBIAN_SRC}"
+	fi
 fi
+mkdir -p "${OUTDIR}"
+git -C "${ARMBIAN_SRC}" rev-parse HEAD > "${OUTDIR}/armbian-commit"
+log "Armbian build framework at $(cat "${OUTDIR}/armbian-commit") ($(tr -d '[:space:]' < "${ARMBIAN_SRC}/VERSION"))"
 
 log "Installing WS1508 userpatches into the Armbian checkout"
 mkdir -p "${ARMBIAN_SRC}/userpatches"
@@ -105,6 +115,7 @@ fi
 [[ "${REVISION}" =~ ^[0-9][A-Za-z0-9.~-]*$ ]] \
 	|| die "REVISION '${REVISION}' must start with a digit and use only letters, digits, '.', '~' and '-'."
 log "Package version for this build: ${REVISION}"
+echo "${REVISION}" > "${OUTDIR}/revision"
 
 # Read on the build host by custom_kernel_config__ws1508_nand() in
 # userpatches/extensions/ws1508-nand.sh, not inside the chroot - so unlike
@@ -244,7 +255,12 @@ if [[ "${MODE}" == "build" ]]; then
 			|| die "Image has no /usr/sbin/ws1508-apt-setup - the board-support package lacks the WS1508 tools."
 		[[ ! -e "${mnt}/usr/local/sbin/ws1508-info" ]] \
 			|| die "Image still has /usr/local/sbin/ws1508-info, which would shadow the packaged /usr/sbin copy."
-		log "Verified: the root filesystem has the update channel, the apt pin and the packaged ws1508-* tools"
+		# KEEP_ORIGINAL_OS_RELEASE (ws1508.conf) makes Armbian skip its own
+		# base-files; the ws1508-bsp extension installs it back.
+		base_files="$(dpkg-query --admindir="${mnt}/var/lib/dpkg" -W -f='${Version}' base-files 2>/dev/null || true)"
+		[[ "${base_files}" == "${REVISION}-"* ]] \
+			|| die "Image has base-files '${base_files}', not Armbian's '${REVISION}-*' - the ws1508-bsp extension did not install it."
+		log "Verified: the root filesystem has the update channel, the apt pin, the packaged ws1508-* tools and Armbian's base-files"
 		umount "${mnt}"
 		losetup -d "${loop}"
 		trap - EXIT
@@ -277,9 +293,10 @@ if [[ "${MODE}" == "build" ]]; then
 		log "Verified: meson_nand.ko is present in $(basename "${found_ko}")"
 
 		# The update channel only works if the board-support package
-		# carries the tools and the postinst that writes the apt pin, and if
-		# every package carries this build's version. All three come from
-		# extension hooks and a command-line override that fail quietly, so
+		# carries the tools and the postinst that writes the apt pin, does
+		# not depend on base-files, and if every package carries this
+		# build's version. All of that comes from extension hooks, a board
+		# config switch and a command-line override that fail quietly, so
 		# check the artifacts themselves.
 		bsp=""
 		shopt -s nullglob
@@ -298,11 +315,14 @@ if [[ "${MODE}" == "build" ]]; then
 		grep -q "ws1508-apt-setup pin" "${bsp_ctl}/postinst" \
 			|| die "$(basename "${bsp}")'s postinst does not write the apt pin - the ws1508-bsp extension did not run."
 		rm -rf "${bsp_ctl}"
+		bsp_depends="$(dpkg-deb -f "${bsp}" Depends)"
+		[[ "${bsp_depends}" != *base-files* ]] \
+			|| die "$(basename "${bsp}") depends on base-files, which the update channel cannot ship: boxes would hold it back once Armbian's VERSION moves on. See KEEP_ORIGINAL_OS_RELEASE in userpatches/config/boards/ws1508.conf."
 		for deb in "${bsp}" "${found_ko}"; do
 			v="$(dpkg-deb -f "${deb}" Version)"
 			[[ "${v}" == "${REVISION}" ]] \
 				|| die "$(basename "${deb}") has version '${v}', not '${REVISION}': installed boxes would not see it as an upgrade."
 		done
-		log "Verified: $(basename "${bsp}") carries the ws1508-* tools and the pin, at version ${REVISION}"
+		log "Verified: $(basename "${bsp}") carries the ws1508-* tools and the pin, does not depend on base-files, and is at version ${REVISION}"
 	fi
 fi

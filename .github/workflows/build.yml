@@ -351,6 +351,8 @@ jobs:
             echo "- Release: \`${{ inputs.release || 'trixie' }}\`"
             echo "- Kernel branch: \`${{ inputs.kernel_branch || 'current' }}\`"
             echo "- Image type: \`${{ inputs.build_type || 'minimal' }}\`"
+            echo "- Package version (what apt shows): \`$(cat "${OUTDIR}/revision" 2>/dev/null || echo unknown)\`"
+            echo "- Armbian build framework: \`$(cat "${OUTDIR}/armbian-commit" 2>/dev/null || echo unknown)\`"
             echo ""
             echo "### SHA256"
             echo ""

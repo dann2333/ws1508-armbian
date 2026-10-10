@@ -28,16 +28,23 @@ UBOOT_COMMIT="${UBOOT_COMMIT:-04cebf40fb349a2bf7b59b4b6dc695abd5b00dcb}"
 AMLIMG_VERSION="${AMLIMG_VERSION:-v0.3.1}"
 AMLIMG_URL="${AMLIMG_URL:-https://github.com/hzyitc/AmlImg/releases/download/${AMLIMG_VERSION}/AmlImg_${AMLIMG_VERSION}_linux_amd64}"
 
-# Armbian build framework.
+# Armbian build framework. Pinned too, and for a reason that did not exist
+# while every release was a fresh image: releases now also go out to boxes in
+# the field through apt (scripts/make-apt-repo.sh), so a regression that
+# Armbian's main branch picks up between a test build and a release reaches
+# every box that runs "apt full-upgrade". Bumping this is routine
+# maintenance: set it to the commit a CI build has just been verified
+# against. A branch or tag name works as well (ARMBIAN_REF=main for a build
+# against today's tip), but a hash is what releases should use.
 ARMBIAN_REPO="${ARMBIAN_REPO:-https://github.com/armbian/build}"
-ARMBIAN_REF="${ARMBIAN_REF:-main}"
+ARMBIAN_REF="${ARMBIAN_REF:-9d855fe8ebf16a81f07e3b5ced62b090dd541c4a}"
 
 # ---------------------------------------------------------------------------
 # Image defaults
 # ---------------------------------------------------------------------------
 BOARD="${BOARD:-ws1508}"
 BRANCH="${BRANCH:-current}"          # Armbian kernel branch (current = 6.12)
-RELEASE="${RELEASE:-bookworm}"       # Debian/Ubuntu userland
+RELEASE="${RELEASE:-trixie}"         # Debian/Ubuntu userland (CI's default too)
 BUILD_MINIMAL="${BUILD_MINIMAL:-no}"
 
 export UBOOT_REPO UBOOT_COMMIT AMLIMG_VERSION AMLIMG_URL

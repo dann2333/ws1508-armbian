@@ -256,7 +256,7 @@ DRAM 基址是 `0x00000000`，不是设备树里写的 `0x40000000`：
 |---|---|
 | `build-uboot.sh` | 编出来的 U-Boot 里同时有 `try nand boot` 和 `try emmc boot`；NAND 探测顺序补丁在位 |
 | `build-armbian.sh` | 镜像 boot 分区里有 `dtb/meson8b-ws1508.dtb`、`boot.scr` 和 `uInitrd`（启动脚本无条件加载 uInitrd，缺了就起不来）；另外有 `dtb/meson8b-ws1508-nand.dtb`，且至少一个 `linux-image-*.deb` 里带 `meson_nand.ko` |
-| `build-armbian.sh` | 板级支持包里有 5 个 `ws1508-*` 工具、postinst 会写 apt pin、包版本等于这次的 `REVISION`；镜像根分区里有更新通道的源文件、pin 和 `/usr/sbin/ws1508-apt-setup`，且没有会挡住它们的 `/usr/local/sbin/ws1508-info` |
+| `build-armbian.sh` | 板级支持包里有 5 个 `ws1508-*` 工具、postinst 会写 apt pin、不依赖 `base-files`、包版本等于这次的 `REVISION`；镜像根分区里有更新通道的源文件、pin 和 `/usr/sbin/ws1508-apt-setup`，装的是 Armbian 的 base-files，且没有会挡住工具的 `/usr/local/sbin/ws1508-info` |
 | `make-apt-repo.sh` | 内核、设备树、板级包都在；每个包的版本都带 `.ws1508.<时间戳>`；文件名不会被 GitHub 改写 |
 | `make-burn-image.sh` | 打好的 burn 包能被 AmlImg 原样解回来，且 5 个必需成员齐全 |
 
@@ -296,14 +296,32 @@ DRAM 基址是 `0x00000000`，不是设备树里写的 `0x40000000`：
 两次内容不同的构建版本号一样，apt 就永远不会认为有更新。
 `build-armbian.sh` 因此在后面追加构建时间：`26.11.0-trunk.ws1508.<UTC 时间戳>`，
 CI 传入的时间戳和 Release 标签是同一个时刻。用 `dpkg --compare-versions` 核对过：
-
-- 比之前所有镜像里的 `26.11.0-trunk` 大；比更早的时间戳大；跨 Armbian `VERSION`
-  升级（如到 `27.2.0-trunk`）仍然递增；
-- 板级支持包依赖 `base-files (>= REVISION)`，老镜像里的
-  `26.11.0-trunk-13.x-trixie` 仍然满足（`-` 之前的上游部分更大）。
+它比之前所有镜像里的 `26.11.0-trunk` 大，比更早的时间戳大，跨 Armbian `VERSION`
+升级（如到 `27.2.0-trunk`）仍然递增。
 
 `make-apt-repo.sh` 拒绝不带 `.ws1508.` 后缀的包，所以绕过 `build-armbian.sh`
 的构建发不出一个「看起来正常、其实什么都不更新」的仓库。
+
+**板级支持包不能依赖 `base-files`。** Armbian 给板级包加了
+`Depends: base-files (>= REVISION)`，保证装上的是它改过的 base-files；在 Armbian
+自己的仓库里两者一起发布，这条依赖总能满足。本项目的通道发不了 base-files：
+它按发行版分别构建，而一个通道要同时服务 bookworm、trixie 和 Ubuntu 的机器
+（内核、设备树、头文件和板级包在 Armbian 里都与发行版无关）。老镜像的
+`26.11.0-trunk-13.8+deb13u6-trixie` 碰巧还满足 `>= 26.11.0-trunk.ws1508.*`，
+可一旦跟进到 `VERSION` 变了的 Armbian（如 `27.2.0-trunk`），所有机器上的板级包
+都会被 apt 卡住。所以 `ws1508.conf` 设了 `KEEP_ORIGINAL_OS_RELEASE=yes` ——
+Armbian 去掉这条依赖的唯一开关。它的另一个作用是镜像里不装 Armbian 的
+base-files，由 `ws1508-bsp.sh` 的 `pre_install_distribution_specific` 钩子装回去，
+所以镜像本身不变。`build-armbian.sh` 两头都检查。
+
+**Armbian 框架钉在一个提交上。** `common.sh` 的 `ARMBIAN_REF` 是完整提交号，
+不是 `main`。以前每个 Release 只是一个新镜像，跟着 main 走无所谓；现在每个
+Release 都会经 apt 推到所有在跑的机器上，Armbian main 在测试构建和正式发布之间
+混进来的回归会直接落到用户机器上。升级它是例行维护：用 `ARMBIAN_REF=main`
+（或想要的提交号）在分支上跑一次 CI、验证产物，再把构建日志里
+`Armbian build framework at <提交号>` 那个提交号写进 `common.sh`。
+每个 Release 的说明里也会写明它用的是哪个提交。跨 `VERSION` 升级时注意
+上一段：板级包不依赖 base-files 这件事要继续成立。
 
 **仓库就是 Release 附件。** 每个 Release 带一份完整的平铺仓库
 （`Packages`、`Packages.gz`、`Release`、内核 / 设备树 / 头文件 / 板级包），
