@@ -65,7 +65,7 @@ sudo reboot
 - 把 `ws1508-*` 工具换成新版，放在 `/usr/sbin/`，
   并删掉老镜像装在 `/usr/local/sbin/` 里的旧副本（不然旧的会排在 PATH 前面挡住新的）
 
-重启后跑一下 `ws1508-info`，最后的「updates」一节应该显示：
+重启后跑一下 `ws1508-info`，其中「updates」一节应该显示：
 
 ```
 linux-image-current-meson        26.11.0-trunk.ws1508.2026xxxxxxxxxx
