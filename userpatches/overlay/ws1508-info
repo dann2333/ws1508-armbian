@@ -1,0 +1,121 @@
+#!/bin/sh
+# Report what this WS1508 actually is, which decides whether the
+# system can live on internal storage, and whether it is set up to
+# receive updates.
+echo "=== WS1508 ==="
+echo "model:   $(cat /proc/device-tree/model 2>/dev/null | tr -d '\0')"
+echo "kernel:  $(uname -r)"
+printf 'memory:  '; awk '/MemTotal/ {printf "%d MB\n", $2/1024}' /proc/meminfo
+echo
+echo "--- what the bootloader found ---"
+# u-boot's own storage detection, handed over on the kernel command
+# line by boot-ws1508.cmd. This is the answer without a serial cable.
+store=$(sed -n 's/.*ws1508\.store=\([0-9]*\).*/\1/p' /proc/cmdline)
+case "$store" in
+    0) echo "store:   SPI (unexpected on this board)" ;;
+    1) echo "store:   raw NAND  <- u-boot detected NAND" ;;
+    2) echo "store:   eMMC      <- u-boot detected eMMC" ;;
+    3) echo "store:   NONE detected - u-boot found no internal flash." ;;
+    *) echo "store:   (not reported; bootloader predates this feature)" ;;
+esac
+echo
+echo "--- internal storage as Linux sees it ---"
+if [ -e /sys/class/mmc_host/mmc1/mmc1:0001 ] || \
+   lsblk -dno NAME 2>/dev/null | grep -q '^mmcblk1$'; then
+    size=$(lsblk -bdno SIZE /dev/mmcblk1 2>/dev/null)
+    echo "type:    eMMC (/dev/mmcblk1)"
+    [ -n "$size" ] && echo "size:    $((size / 1024 / 1024)) MB"
+    echo
+    echo "This unit CAN run entirely from internal storage:"
+    echo "'ws1508-install-to-emmc' copies this system onto it, or"
+    echo "flash the full Armbian-*.burn.img with the USB Burning Tool."
+else
+    echo "type:    no eMMC detected - this is most likely a raw-NAND unit"
+    echo
+    if [ -e /sys/class/mtd/mtd0 ]; then
+        # Report per partition. The device tree splits the chip into
+        # a read-only "vendor" region and a writable "ubi" one, so
+        # mtd0's size is NOT the chip size and mtd0's flags can never
+        # show writable however meson_nand.allow_write is set.
+        for d in /sys/class/mtd/mtd[0-9]*; do
+            case "${d}" in *ro) continue ;; esac
+            [ -r "${d}/name" ] || continue
+            mtdsize=$(cat "${d}/size" 2>/dev/null || echo 0)
+            mtdflags=$(cat "${d}/flags" 2>/dev/null || echo 0)
+            # 0x400 is MTD_WRITEABLE
+            if [ $((mtdflags & 0x400)) -eq 0 ]; then
+                acc="read-only"
+            else
+                acc="WRITABLE"
+            fi
+            printf '%-9s %-8s %5s MB  %s\n' "${d##*/}:" \
+                "$(cat "${d}/name")" "$((mtdsize / 1024 / 1024))" "${acc}"
+        done
+        mtdtype=$(cat /sys/class/mtd/mtd0/type 2>/dev/null || echo '?')
+        echo "geometry: erase block $(cat /sys/class/mtd/mtd0/erasesize) B, page $(cat /sys/class/mtd/mtd0/writesize) B, ${mtdtype}"
+        # The module parameter is the global switch; a partition can
+        # still be read-only on top of it because the dts says so, and
+        # the driver keeps everything read-only when it cannot give the
+        # chip the ECC it requires.
+        aw=$(cat /sys/module/meson_nand/parameters/allow_write 2>/dev/null || echo '?')
+        echo "allow_write: ${aw}  (N = the driver's read-only default)"
+        # The driver's own one-line report: geometry, ECC, clock and the
+        # full chip ID, which is what identifies the part.
+        dmesg 2>/dev/null | grep -E "meson-nand.*(page [0-9]+ oob|read-only)" | sed 's/^/  /'
+        echo
+        if [ "${mtdtype}" = "mlc-nand" ]; then
+            echo "This chip is MLC. UBI refuses MLC flash, so the internal"
+            echo "NAND cannot hold the root filesystem: keep running from"
+            echo "the USB stick, which is the supported setup for this unit."
+        else
+            echo "The driver attached. Reading vendor-written pages correctly"
+            echo "is still unverified on this SoC; 'ws1508-nand-probe' can"
+            echo "dump a sample for comparison. Installing to NAND is"
+            echo "experimental and no unit has completed it yet."
+        fi
+    else
+        echo "There is no /dev/mtd0. Two possible reasons:"
+        echo
+        echo "  1. the running device tree leaves the NAND"
+        echo "     controller disabled - the default, and the"
+        echo "     likely one. To turn it on, add this to"
+        echo "     /boot/armbianEnv.txt and reboot:"
+        echo
+        echo "         fdtfile=meson8b-ws1508-nand.dtb"
+        echo
+        echo "  2. it is enabled and the driver declined the chip."
+        echo "     It does that for parts with pages larger than"
+        echo "     4KiB, such as the Hynix H27UBG8T2C found in these"
+        echo "     boxes. 'dmesg | grep -i meson-nand' says which."
+        echo
+        echo "Either way the root filesystem stays on USB or SD: flash"
+        echo "ws1508-uboot.burn.img (bootloader only) and boot the"
+        echo "system from a USB stick."
+    fi
+fi
+echo
+echo "--- updates ---"
+# The board packages that apt keeps current, and whether it can: the
+# update channel is the ws1508.sources file, the pin is what stops
+# Armbian's own same-named kernel packages (which cannot boot this box)
+# from replacing these. ws1508-apt-setup manages both.
+for p in linux-image-current-meson linux-dtb-current-meson armbian-bsp-cli-ws1508-current; do
+    v=$(dpkg-query -W -f '${Version}' "$p" 2>/dev/null) || v="(not installed)"
+    printf '%-32s %s\n' "$p" "$v"
+done
+if [ -f /etc/apt/sources.list.d/ws1508.sources ]; then
+    echo "channel: enabled  ('apt update && apt full-upgrade' updates the kernel too)"
+else
+    echo "channel: NOT enabled - run 'ws1508-apt-setup' to get updates through apt"
+fi
+if [ -f /etc/apt/preferences.d/ws1508 ]; then
+    echo "pin:     present"
+else
+    echo "pin:     MISSING - run 'ws1508-apt-setup pin' before the next 'apt upgrade'"
+fi
+echo
+echo "--- current root ---"
+findmnt -no SOURCE,FSTYPE,SIZE,USED /  2>/dev/null || df -h /
+echo
+echo "--- swap ---"
+swapon --show 2>/dev/null || echo "(none)"

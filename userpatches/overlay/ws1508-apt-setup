@@ -1,0 +1,227 @@
+#!/bin/bash
+#
+# Turn on (or repair) the WS1508 update channel.
+#
+# Every release of https://github.com/dann2333/ws1508-armbian also
+# publishes the WS1508 kernel, device trees and board-support package as
+# Debian packages, laid out as an apt repository. This script points apt at
+# it, so that from then on an ordinary
+#
+#     apt update && apt full-upgrade
+#
+# keeps the box current. Nothing is reflashed and nothing on the box is
+# erased; it is the same mechanism every Armbian board uses, with this
+# project's builds in place of Armbian's.
+#
+# It also installs an apt pin, and the pin matters even if you never use the
+# update channel. Armbian's own repository publishes kernel packages with
+# the very same names -- linux-image-current-meson, linux-dtb-current-meson
+# -- built WITHOUT the WS1508 device trees. A routine "apt upgrade" that
+# pulled those in would replace the device tree the boot script loads, and
+# the box would not boot again. Today the builds in this image happen to
+# carry a higher version number than Armbian's, so apt leaves them alone;
+# the first Armbian release numbered above it (26.11.1 or later) would
+# reverse that.
+#
+# Usage:
+#   ws1508-apt-setup              pin + source, apt update, upgrade the
+#                                 WS1508 packages (asks first)
+#   ws1508-apt-setup --yes        the same without asking
+#   ws1508-apt-setup enable       write the pin and the source, nothing else
+#   ws1508-apt-setup pin          write the pin only
+#   ws1508-apt-setup disable      remove the source; the pin stays
+#   ws1508-apt-setup refresh      rewrite the source if it is enabled
+#   ws1508-apt-setup print-pin    print the pin file to stdout
+#   ws1508-apt-setup print-source print the source file to stdout
+#
+# Old images do not have this command. Fetch it from the latest release:
+#
+#   curl -fLO https://github.com/dann2333/ws1508-armbian/releases/latest/download/ws1508-apt-setup.sh
+#   sudo bash ws1508-apt-setup.sh
+#
+# This file is the single source of truth for both files it writes: the
+# board-support package runs "pin" and "refresh" from its postinst, and the
+# image build runs "print-source" to put the source into new images.
+
+set -euo pipefail
+
+REPO_URL="${WS1508_APT_URL:-https://github.com/dann2333/ws1508-armbian/releases/latest/download/}"
+PIN_FILE=/etc/apt/preferences.d/ws1508
+SOURCE_FILE=/etc/apt/sources.list.d/ws1508.sources
+
+die()  { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33mWarning:\033[0m %s\n' "$*" >&2; }
+
+print_pin() {
+	cat <<'EOF'
+# Installed by ws1508-apt-setup (ws1508-armbian). Do not edit; it is
+# rewritten whenever the WS1508 board-support package is upgraded.
+#
+# Keep the WS1508's kernel, device trees and board-support package on
+# ws1508-armbian builds. Armbian's repository (apt.armbian.com and every
+# mirror of it, all of which publish Origin "Armbian") carries packages with
+# the same names built without the WS1508 device trees and the meson8b NAND
+# patches. Installing them leaves the box without the device tree its boot
+# script loads, and it does not boot. Priority -1: never take these from
+# there. Everything else from Armbian's repository is unaffected.
+Package: /^linux-(image|dtb|headers|libc-dev)-[a-z0-9]+-meson$/ /^armbian-bsp-cli-ws1508/
+Pin: release o=Armbian
+Pin-Priority: -1
+EOF
+}
+
+print_source() {
+	cat <<EOF
+# Installed by ws1508-apt-setup (ws1508-armbian): the WS1508 kernel, device
+# trees, boot script and ws1508-* tools, as built by
+# https://github.com/dann2333/ws1508-armbian. "latest" follows the newest
+# published release. Remove this file, or run "ws1508-apt-setup disable",
+# to stop receiving them.
+#
+# The repository is not signed. What protects it is HTTPS to github.com and
+# the SHA256 of every package in its index -- the same trust you placed in
+# the image you flashed, which came from the same place.
+Types: deb
+URIs: ${REPO_URL}
+Suites: ./
+Trusted: yes
+EOF
+}
+
+# Write $2 from function $1 atomically, so a reader never sees half a file.
+write_file() {
+	local gen="$1" dest="$2" tmp
+	mkdir -p "$(dirname "${dest}")"
+	tmp="$(mktemp "${dest}.XXXXXX")"
+	"${gen}" > "${tmp}"
+	chmod 0644 "${tmp}"
+	mv -f "${tmp}" "${dest}"
+}
+
+need_root() {
+	[ "$(id -u)" -eq 0 ] || die "Run this as root (sudo)."
+}
+
+# The source is WS1508-specific; the pin is harmless anywhere.
+check_board() {
+	local board="" model=""
+	[ -r /etc/armbian-release ] && board="$(sed -n 's/^BOARD=//p' /etc/armbian-release | head -1)"
+	model="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)"
+	case "${board},${model}" in
+		ws1508,*|*,*WS1508*) return 0 ;;
+	esac
+	[ "${FORCE:-no}" = yes ] && return 0
+	die "This does not look like a WS1508 (BOARD='${board:-?}', model='${model:-?}').
+These packages are built for the WS1508 only. Use --force if you are sure."
+}
+
+# dpkg-query exits non-zero when a pattern matches nothing, which is normal
+# here (most boxes have no headers installed); only its output matters.
+installed_ws1508_packages() {
+	{ dpkg-query -W -f '${db:Status-Status} ${Package}\n' \
+		'linux-image-*-meson' 'linux-dtb-*-meson' 'linux-headers-*-meson' \
+		'armbian-bsp-cli-ws1508*' 2>/dev/null || true; } \
+		| awk '$1 == "installed" { print $2 }'
+}
+
+do_pin() {
+	need_root
+	write_file print_pin "${PIN_FILE}"
+	info "Pinned the WS1508 kernel packages away from Armbian's repository (${PIN_FILE})"
+}
+
+do_enable() {
+	need_root
+	check_board
+	write_file print_pin "${PIN_FILE}"
+	write_file print_source "${SOURCE_FILE}"
+	info "Update channel enabled (${SOURCE_FILE})"
+}
+
+do_disable() {
+	need_root
+	rm -f "${SOURCE_FILE}"
+	info "Update channel disabled. The pin in ${PIN_FILE} stays: it is what keeps"
+	info "Armbian's own kernel packages, which cannot boot this box, from being installed."
+}
+
+do_refresh() {
+	need_root
+	if [ -f "${SOURCE_FILE}" ]; then
+		write_file print_source "${SOURCE_FILE}"
+	fi
+}
+
+do_full() {
+	local yes="$1" pkgs
+	need_root
+	check_board
+	write_file print_pin "${PIN_FILE}"
+	write_file print_source "${SOURCE_FILE}"
+	info "Update channel enabled (${SOURCE_FILE})"
+
+	info "Refreshing package lists"
+	if ! apt-get update; then
+		die "apt-get update failed. The channel is configured; check the network and
+run 'apt update' again. Nothing has been upgraded."
+	fi
+
+	mapfile -t pkgs < <(installed_ws1508_packages)
+	if [ "${#pkgs[@]}" -eq 0 ]; then
+		warn "No WS1508 kernel or board packages are installed under the expected names."
+		warn "Nothing to upgrade here; 'apt full-upgrade' will still work."
+		return 0
+	fi
+
+	echo
+	echo "  WS1508 packages on this box, and what the channel offers:"
+	echo
+	local p inst cand
+	for p in "${pkgs[@]}"; do
+		inst="$(dpkg-query -W -f '${Version}' "${p}" 2>/dev/null || echo '?')"
+		cand="$(apt-cache policy "${p}" 2>/dev/null | sed -n 's/^ *Candidate: *//p' | head -1)"
+		printf '    %-34s %s  ->  %s\n' "${p}" "${inst}" "${cand:-?}"
+	done
+	echo
+
+	local -a apt_args=(install --only-upgrade)
+	if [ "${yes}" = yes ]; then
+		apt_args+=(-y)
+	fi
+	info "Upgrading the WS1508 packages"
+	apt-get "${apt_args[@]}" "${pkgs[@]}"
+
+	echo
+	if [ -e /var/run/.reboot_required ] || [ -e /var/run/reboot-required ]; then
+		info "Done. Reboot to run the new kernel:  reboot"
+	else
+		info "Done."
+	fi
+	echo "  From now on, 'apt update && apt full-upgrade' keeps this box current,"
+	echo "  WS1508 kernel included. Nothing needs reflashing for that."
+}
+
+FORCE=no
+YES=no
+cmd=""
+for a in "$@"; do
+	case "${a}" in
+		--yes|-y) YES=yes ;;
+		--force)  FORCE=yes ;;
+		-h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
+		-*) die "Unknown option: ${a}" ;;
+		*) [ -z "${cmd}" ] || die "Only one command at a time."; cmd="${a}" ;;
+	esac
+done
+
+case "${cmd}" in
+	"")           do_full "${YES}" ;;
+	enable)       do_enable ;;
+	pin)          do_pin ;;
+	disable)      do_disable ;;
+	refresh)      do_refresh ;;
+	print-pin)    print_pin ;;
+	print-source) print_source ;;
+	*) die "Unknown command: ${cmd} (see --help)" ;;
+esac

@@ -89,6 +89,23 @@ fi
 # changes behaviour in ways that break a plain `compile.sh` invocation.
 export GITHUB_ACTIONS=false
 
+# Package versions. Armbian stamps everything it builds with REVISION, which
+# defaults to the checkout's VERSION file -- "26.11.0-trunk" for months on
+# end -- so two builds with different contents get the same version, and
+# apt on a box that already has one never offers the other. The update
+# channel (scripts/make-apt-repo.sh) depends on every build sorting above
+# the last, so append a UTC build stamp: "26.11.0-trunk.ws1508.<stamp>"
+# sorts above the bare "26.11.0-trunk" every image so far shipped with, and
+# above every earlier stamp. CI passes the stamp it also uses for the
+# release tag, so a package version names the release it came from.
+WS1508_BUILD_STAMP="${WS1508_BUILD_STAMP:-$(date -u +%Y%m%d%H%M%S)}"
+if [[ -z "${REVISION:-}" ]]; then
+	REVISION="$(tr -d '[:space:]' < "${ARMBIAN_SRC}/VERSION").ws1508.${WS1508_BUILD_STAMP}"
+fi
+[[ "${REVISION}" =~ ^[0-9][A-Za-z0-9.~-]*$ ]] \
+	|| die "REVISION '${REVISION}' must start with a digit and use only letters, digits, '.', '~' and '-'."
+log "Package version for this build: ${REVISION}"
+
 # Read on the build host by custom_kernel_config__ws1508_nand() in
 # userpatches/extensions/ws1508-nand.sh, not inside the chroot - so unlike
 # the other WS1508_* knobs it does not belong in ws1508-build.conf. Export
@@ -101,6 +118,7 @@ COMMON_ARGS=(
 	BOARD="${BOARD}"
 	BRANCH="${BRANCH}"
 	EXPERT=yes
+	REVISION="${REVISION}"
 	USE_CCACHE=no
 )
 
@@ -198,6 +216,38 @@ if [[ "${MODE}" == "build" ]]; then
 		umount "${mnt}"
 		losetup -d "${loop}"
 		trap - EXIT
+
+		# And the root filesystem: the update channel is switched on by a
+		# hook at the very end of the image build, and the apt pin by the
+		# board-support package's postinst inside it. Either can be lost
+		# without the build noticing.
+		root_lba="$(python3 - "${img}" <<-'PY'
+			import struct, sys
+			with open(sys.argv[1], 'rb') as f:
+			    mbr = f.read(512)
+			e = mbr[462:478]
+			start, sectors = struct.unpack_from('<II', e, 8)
+			if e[4] == 0 or not sectors:
+			    sys.exit('no second partition')
+			print(start)
+		PY
+		)" || die "Cannot find the root partition of ${img}: ${root_lba}"
+		loop="$(losetup --find --show --offset "$((root_lba * 512))" "${img}")"
+		mnt="$(mktemp -d)"
+		trap 'umount "${mnt}" 2>/dev/null || true; losetup -d "${loop}" 2>/dev/null || true' EXIT
+		mount -o ro "${loop}" "${mnt}"
+		[[ -f "${mnt}/etc/apt/sources.list.d/ws1508.sources" ]] \
+			|| die "Image has no /etc/apt/sources.list.d/ws1508.sources - the update channel hook did not run."
+		[[ -f "${mnt}/etc/apt/preferences.d/ws1508" ]] \
+			|| die "Image has no /etc/apt/preferences.d/ws1508 - without that pin an 'apt upgrade' can install a kernel that cannot boot this box."
+		[[ -x "${mnt}/usr/sbin/ws1508-apt-setup" ]] \
+			|| die "Image has no /usr/sbin/ws1508-apt-setup - the board-support package lacks the WS1508 tools."
+		[[ ! -e "${mnt}/usr/local/sbin/ws1508-info" ]] \
+			|| die "Image still has /usr/local/sbin/ws1508-info, which would shadow the packaged /usr/sbin copy."
+		log "Verified: the root filesystem has the update channel, the apt pin and the packaged ws1508-* tools"
+		umount "${mnt}"
+		losetup -d "${loop}"
+		trap - EXIT
 	fi
 
 	# A dtb that enables a controller with no driver behind it is worse
@@ -225,5 +275,34 @@ if [[ "${MODE}" == "build" ]]; then
 		[[ -n "${found_ko}" ]] \
 			|| die "No linux-image .deb contains meson_nand.ko - the raw-NAND kernel patches or the ws1508-nand extension did not take effect."
 		log "Verified: meson_nand.ko is present in $(basename "${found_ko}")"
+
+		# The update channel only works if the board-support package
+		# carries the tools and the postinst that writes the apt pin, and if
+		# every package carries this build's version. All three come from
+		# extension hooks and a command-line override that fail quietly, so
+		# check the artifacts themselves.
+		bsp=""
+		shopt -s nullglob
+		for deb in "${OUTDIR}"/debs/armbian-bsp-cli-ws1508-*.deb; do
+			bsp="${deb}"
+		done
+		shopt -u nullglob
+		[[ -n "${bsp}" ]] || die "No armbian-bsp-cli-ws1508-*.deb in ${OUTDIR}/debs."
+		bsp_files="$(dpkg-deb -c "${bsp}" 2>/dev/null || true)"
+		for tool in ws1508-info ws1508-install-to-emmc ws1508-install-to-nand ws1508-nand-probe ws1508-apt-setup; do
+			grep -q "\./usr/sbin/${tool}\$" <<< "${bsp_files}" \
+				|| die "$(basename "${bsp}") does not contain /usr/sbin/${tool} - the ws1508-bsp extension did not run."
+		done
+		bsp_ctl="$(mktemp -d)"
+		dpkg-deb -e "${bsp}" "${bsp_ctl}"
+		grep -q "ws1508-apt-setup pin" "${bsp_ctl}/postinst" \
+			|| die "$(basename "${bsp}")'s postinst does not write the apt pin - the ws1508-bsp extension did not run."
+		rm -rf "${bsp_ctl}"
+		for deb in "${bsp}" "${found_ko}"; do
+			v="$(dpkg-deb -f "${deb}" Version)"
+			[[ "${v}" == "${REVISION}" ]] \
+				|| die "$(basename "${deb}") has version '${v}', not '${REVISION}': installed boxes would not see it as an upgrade."
+		done
+		log "Verified: $(basename "${bsp}") carries the ws1508-* tools and the pin, at version ${REVISION}"
 	fi
 fi

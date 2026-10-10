@@ -6,12 +6,15 @@ on:
       release:
         description: 'Userland release'
         required: true
-        default: 'bookworm'
+        default: 'trixie'
         type: choice
         options:
+          # Armbian marks trixie, noble and resolute "supported" and bookworm
+          # community-supported (config/distributions/*/support).
+          - trixie      # Debian 13 (default)
           - bookworm    # Debian 12
-          - trixie      # Debian 13
           - noble       # Ubuntu 24.04 LTS
+          - resolute    # Ubuntu 26.04 LTS
       kernel_branch:
         description: 'Armbian kernel branch'
         required: true
@@ -83,7 +86,7 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Prepare scratch space
         run: |
@@ -104,7 +107,7 @@ jobs:
         run: bash scripts/build-uboot.sh
 
       - name: Upload bootloader
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ws1508-uboot
           path: |
@@ -117,7 +120,7 @@ jobs:
   # The Armbian image, plus the combined direct-flash burn package.
   # ---------------------------------------------------------------------
   image:
-    name: Build image (${{ inputs.release || 'bookworm' }} / ${{ inputs.build_type || 'minimal' }})
+    name: Build image (${{ inputs.release || 'trixie' }} / ${{ inputs.build_type || 'minimal' }})
     needs: uboot
     runs-on: ubuntu-24.04
     outputs:
@@ -140,7 +143,7 @@ jobs:
           echo "After:"; df -h / /mnt
 
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Prepare scratch space
         run: |
@@ -148,7 +151,7 @@ jobs:
           sudo chown -R "$(id -u):$(id -g)" /mnt/ws1508
 
       - name: Download bootloader
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ws1508-uboot
           path: /mnt/ws1508/out/uboot
@@ -157,7 +160,7 @@ jobs:
         run: |
           sudo apt-get -qq update
           sudo apt-get -qq install -y --no-install-recommends \
-            git curl xz-utils zstd jq python3 \
+            git curl xz-utils zstd jq python3 apt-utils \
             android-sdk-libsparse-utils device-tree-compiler
 
       - name: Build metadata
@@ -166,18 +169,28 @@ jobs:
           created="$(date -u +'%Y%m%d-%H%M%S')"
           echo "tag=build-${created}" >> "$GITHUB_OUTPUT"
           echo "name=WS1508 Armbian ${created}" >> "$GITHUB_OUTPUT"
+          # The same instant, as the suffix build-armbian.sh appends to every
+          # package version, so a package names the release it came from.
+          echo "stamp=${created//-/}" >> "$GITHUB_OUTPUT"
 
       - name: Build the Armbian image
         env:
           BOARD: ws1508
           BRANCH: ${{ inputs.kernel_branch || 'current' }}
-          RELEASE: ${{ inputs.release || 'bookworm' }}
+          RELEASE: ${{ inputs.release || 'trixie' }}
           BUILD_MINIMAL: ${{ (inputs.build_type == 'cli') && 'no' || 'yes' }}
           WS1508_ROOT_PASSWORD: ${{ inputs.root_password || '1234' }}
           WS1508_SSH_AUTHORIZED_KEY: ${{ inputs.ssh_authorized_key }}
           WS1508_TIMEZONE: Asia/Shanghai
+          WS1508_BUILD_STAMP: ${{ steps.meta.outputs.stamp }}
         run: |
           sudo -E bash scripts/build-armbian.sh build
+
+      # The update channel: the kernel, device-tree and board-support
+      # packages as a flat apt repository, published with the release so
+      # that boxes in the field upgrade with apt instead of a reflash.
+      - name: Lay out the apt repository
+        run: sudo -E bash scripts/make-apt-repo.sh
 
       - name: Pack the direct-flash burn image
         run: sudo -E bash scripts/make-burn-image.sh
@@ -185,8 +198,25 @@ jobs:
       # The NAND kernel package. Must run before the image is compressed
       # below, because it reads the kernel, initrd and dtb back out of the
       # built .img's boot partition.
+      #
+      # Kept as a build artifact for experimenters, and deliberately NOT
+      # published with the release: the only WS1508 NAND chip reported so
+      # far (a Hynix H27UBG8T2C, issue #2) is MLC with 8KiB pages, which UBI
+      # refuses and this driver cannot read, so the package cannot complete
+      # an install on known hardware -- while flashing it costs the erase,
+      # and the erase costs the unit's nkey/nsec.
       - name: Pack the NAND boot image
         run: sudo -E bash scripts/make-nand-image.sh
+
+      - name: Upload the experimental NAND package
+        uses: actions/upload-artifact@v7
+        with:
+          name: ws1508-nand-experimental
+          path: |
+            /mnt/ws1508/out/nand/ws1508-nand.burn.img
+            /mnt/ws1508/out/nand/ws1508-nand-boot.andr
+          retention-days: 14
+          if-no-files-found: warn
 
       - name: Collect artifacts
         id: collect
@@ -196,14 +226,14 @@ jobs:
 
           # The bootloader-only package belongs next to the images: it is
           # what raw-NAND owners need first.
-          cp uboot/ws1508-uboot.burn.img images/ 2>/dev/null || true
+          cp uboot/ws1508-uboot.burn.img images/
 
-          # The NAND kernel package and the bare boot.img inside it. Both
-          # are useful: the .burn.img installs through the USB Burning
-          # Tool, the .andr is what you would write by hand from a u-boot
-          # prompt with "usb_update boot".
-          cp nand/ws1508-nand.burn.img images/ 2>/dev/null || true
-          cp nand/ws1508-nand-boot.andr images/ 2>/dev/null || true
+          # The apt repository goes up as release assets too: every release
+          # is a complete repository, and the source boxes use points at
+          # releases/latest/download/. Copied, not optional -- a release
+          # without it would leave every box that follows the channel on
+          # its current version.
+          cp apt/* images/
 
           cd images
 
@@ -227,9 +257,9 @@ jobs:
           ls -la
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: ws1508-${{ inputs.release || 'bookworm' }}-${{ inputs.build_type || 'minimal' }}
+          name: ws1508-${{ inputs.release || 'trixie' }}-${{ inputs.build_type || 'minimal' }}
           path: /mnt/ws1508/out/images/*
           retention-days: 30
           if-no-files-found: error
@@ -243,6 +273,27 @@ jobs:
 
           Amlogic S805 / meson8b · 512MB RAM · 100M 网口 · 1x USB 2.0
 
+          ### 已经在用旧版本？不用重刷
+
+          SSH 进去跑下面三行，开启更新通道并把内核升到这一版。之后就和普通
+          Armbian 一样用 `apt` 升级，内核和设备树一起更新，数据不动：
+
+          ```
+          curl -fLO https://github.com/dann2333/ws1508-armbian/releases/latest/download/ws1508-apt-setup.sh
+          sudo bash ws1508-apt-setup.sh
+          sudo reboot
+          ```
+
+          **所有老设备都建议尽快跑一次**，哪怕暂时不想升级（那就用
+          `sudo bash ws1508-apt-setup.sh pin`）：Armbian 官方源里有同名的
+          `linux-image-current-meson` / `linux-dtb-current-meson`，但不带
+          WS1508 的设备树。官方一旦发布 26.11.1 或更高版本，老镜像上一次
+          普通的 `apt upgrade` 就会装上它，机器随即无法启动。这个脚本装的
+          pin 就是防这个的。详见 `docs/upgrading.md`。
+
+          这一版起刷的新镜像已经自带更新通道和 pin，以后直接
+          `apt update && apt full-upgrade` 即可。
+
           ### 下载哪个文件？
 
           **不确定就照这两个来。** 两种机器都适用，也不动内置存储里的数据：
@@ -250,23 +301,22 @@ jobs:
           1. `ws1508-uboot.burn.img` — 用 USB Burning Tool 刷入，换掉原厂引导
           2. `Armbian-*.img.xz` — 解压后写入 U 盘
 
-          开机后跑 `ws1508-info`，它会报出机器是 eMMC 版还是 NAND 版，再决定
-          要不要把系统装进内置存储。
+          开机后跑 `ws1508-info`，它会报出机器是 eMMC 版还是 NAND 版。
 
           | 文件 | 给谁 | 说明 |
           |---|---|---|
           | `ws1508-uboot.burn.img` | 所有人 | 1.4MB，只换引导 |
           | `Armbian-*.img.xz` | 所有人 | 写 U 盘/SD 卡启动 |
           | `Armbian-*.burn.img` | **仅 eMMC 版** | 引导 + 系统一次刷进 eMMC |
-          | `ws1508-nand.burn.img` | **仅 NAND 版** | 引导 + NAND 内核。根文件系统还要进系统跑 `ws1508-install-to-nand` |
-          | `ws1508-nand-boot.andr` | 仅 NAND 版 | 上一个包里的裸 Android boot.img，只有手动敲 u-boot 命令时才用得上 |
+          | `*.deb`、`Packages*`、`Release` | 不用手动下载 | apt 更新通道的仓库文件 |
+          | `ws1508-apt-setup.sh` | 已装旧版本的机器 | 开启更新通道，见上 |
 
           `.burn.img` 都用 **Amlogic USB Burning Tool** 刷入。详细步骤见
           `docs/flashing.md`。
 
           ⚠️ **别把 `Armbian-*.burn.img` 刷进 NAND 版。** 它的 `boot` 是 FAT
-          分区镜像，会盖掉 NAND 内核；`rootfs` 落在 UBI 占的物理区域上，Linux
-          再也读不回来。
+          分区镜像，会盖掉 NAND 里的内容；`rootfs` 经厂商 NFTL 写下去，Linux
+          读不回来。
 
           ⚠️ **NAND 版刷本项目的引导必须勾「擦除 flash」**，`ws1508-uboot.burn.img`
           也一样。本项目改了 NAND 分区表，不勾擦除时烧录工具用
@@ -276,8 +326,15 @@ jobs:
           说明是 eMMC 版；卡在初始化存储那一步失败，说明是 NAND 版，勾上擦除
           再刷一次。详见 `docs/flashing.md`。
 
-          ⚠️ NAND 版装内置系统（`ws1508-nand.burn.img` + `ws1508-install-to-nand`）
-          **从未在实机上验证过**。先刷引导 + U 盘把机器跑起来，确认正常再考虑。
+          ### NAND 版：系统跑在 U 盘上
+
+          第一份 WS1508 NAND 版实测（issue #2）显示闪存是海力士
+          **H27UBG8T2C**：MLC、8KB 页。UBI 拒绝挂载 MLC，主线驱动在 S805 上
+          也读不了 8KB 页，所以**系统装不进内置 NAND**，U 盘启动就是这类机器
+          的正式用法。旧内核会把这颗芯片误认成 4KB 页，在
+          `meson_nand.allow_write=1` 下擦写会落到错误的物理块上 —— 这一版的
+          内核已改为正确识别并拒绝挂载，`ws1508-install-to-nand` 也会在擦除前
+          就拒绝 MLC。NAND 安装包因此不再随 Release 发布。
 
           ### 默认登录
 
@@ -291,7 +348,7 @@ jobs:
           EOF
           {
             echo ""
-            echo "- Release: \`${{ inputs.release || 'bookworm' }}\`"
+            echo "- Release: \`${{ inputs.release || 'trixie' }}\`"
             echo "- Kernel branch: \`${{ inputs.kernel_branch || 'current' }}\`"
             echo "- Image type: \`${{ inputs.build_type || 'minimal' }}\`"
             echo ""
@@ -305,10 +362,15 @@ jobs:
 
       - name: Publish release
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish_release }}
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
           name: ${{ steps.meta.outputs.name }}
           body_path: /tmp/release.md
           target_commitish: ${{ github.sha }}
           files: /mnt/ws1508/out/images/*
+          fail_on_unmatched_files: true
+          # The update channel follows releases/latest, so a new release
+          # must become "latest" -- said explicitly rather than left to the
+          # API default.
+          make_latest: true

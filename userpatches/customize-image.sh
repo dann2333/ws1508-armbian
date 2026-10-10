@@ -43,7 +43,7 @@ HOSTNAME="${WS1508_HOSTNAME:-ws1508}"
 TIMEZONE="${WS1508_TIMEZONE:-Asia/Shanghai}"
 EXTRA_PACKAGES="${WS1508_EXTRA_PACKAGES:-}"
 
-# Needed by /usr/local/sbin/ws1508-install-to-emmc. BUILD_MINIMAL images do
+# Needed by /usr/sbin/ws1508-install-to-emmc. BUILD_MINIMAL images do
 # not carry rsync or dosfstools, and discovering that only when the user
 # tries to install to eMMC would be a poor joke.
 #
@@ -301,146 +301,14 @@ trim_services() {
 }
 
 # ---------------------------------------------------------------------------
-# A small helper so users can tell which WS1508 variant they have
+# Login banner and initramfs. The ws1508-* tools themselves are NOT installed
+# here any more: they live in the board-support package
+# (userpatches/extensions/ws1508-bsp.sh), so that apt can update them on a
+# box in the field. Anything this script puts into the rootfs is frozen at
+# whatever the image shipped with.
 # ---------------------------------------------------------------------------
 install_helper() {
-	say "Installing the ws1508-info helper"
-	cat > /usr/local/sbin/ws1508-info <<-'EOF'
-		#!/bin/sh
-		# Report what this WS1508 actually is, which decides whether the
-		# system can live on internal storage.
-		echo "=== WS1508 ==="
-		echo "model:   $(cat /proc/device-tree/model 2>/dev/null | tr -d '\0')"
-		echo "kernel:  $(uname -r)"
-		printf 'memory:  '; awk '/MemTotal/ {printf "%d MB\n", $2/1024}' /proc/meminfo
-		echo
-		echo "--- what the bootloader found ---"
-		# u-boot's own storage detection, handed over on the kernel command
-		# line by boot-ws1508.cmd. This is the answer without a serial cable.
-		store=$(sed -n 's/.*ws1508\.store=\([0-9]*\).*/\1/p' /proc/cmdline)
-		case "$store" in
-		    0) echo "store:   SPI (unexpected on this board)" ;;
-		    1) echo "store:   raw NAND  <- u-boot detected NAND" ;;
-		    2) echo "store:   eMMC      <- u-boot detected eMMC" ;;
-		    3) echo "store:   NONE detected - u-boot found no internal flash." ;;
-		    *) echo "store:   (not reported; bootloader predates this feature)" ;;
-		esac
-		echo
-		echo "--- internal storage as Linux sees it ---"
-		if [ -e /sys/class/mmc_host/mmc1/mmc1:0001 ] || \
-		   lsblk -dno NAME 2>/dev/null | grep -q '^mmcblk1$'; then
-		    size=$(lsblk -bdno SIZE /dev/mmcblk1 2>/dev/null)
-		    echo "type:    eMMC (/dev/mmcblk1)"
-		    [ -n "$size" ] && echo "size:    $((size / 1024 / 1024)) MB"
-		    echo
-		    echo "This unit CAN run entirely from internal storage."
-		    echo "Flash the full *.burn.img with the Amlogic USB Burning Tool."
-		else
-		    echo "type:    no eMMC detected - this is most likely a raw-NAND unit"
-		    echo
-		    if [ -e /sys/class/mtd/mtd0 ]; then
-		        # Report per partition. The device tree splits the chip into
-		        # a read-only "vendor" region and a writable "ubi" one, so
-		        # mtd0's size is NOT the chip size and mtd0's flags can never
-		        # show writable however meson_nand.allow_write is set.
-		        for d in /sys/class/mtd/mtd[0-9]*; do
-		            case "${d}" in *ro) continue ;; esac
-		            [ -r "${d}/name" ] || continue
-		            mtdsize=$(cat "${d}/size" 2>/dev/null || echo 0)
-		            mtdflags=$(cat "${d}/flags" 2>/dev/null || echo 0)
-		            # 0x400 is MTD_WRITEABLE
-		            if [ $((mtdflags & 0x400)) -eq 0 ]; then
-		                acc="read-only"
-		            else
-		                acc="WRITABLE"
-		            fi
-		            printf '%-9s %-8s %5s MB  %s\n' "${d##*/}:" \
-		                "$(cat "${d}/name")" "$((mtdsize / 1024 / 1024))" "${acc}"
-		        done
-		        echo "geometry: erase block $(cat /sys/class/mtd/mtd0/erasesize) B, page $(cat /sys/class/mtd/mtd0/writesize) B"
-		        # The module parameter is the global switch; a partition can
-		        # still be read-only on top of it because the dts says so.
-		        aw=$(cat /sys/module/meson_nand/parameters/allow_write 2>/dev/null || echo '?')
-		        echo "allow_write: ${aw}  (N = the driver's read-only default)"
-		        echo
-		        echo "The raw-NAND driver is bound and enumerated the chip."
-		        echo "Whether it is reading it CORRECTLY is a separate"
-		        echo "question: this driver has never run on meson8b"
-		        echo "silicon, and until the ECC strength and scrambler"
-		        echo "settings are confirmed to match the vendor, reads of"
-		        echo "vendor-written pages may come back uncorrectable."
-		        echo
-		        echo "Booting from it IS implemented, but has never run on"
-		        echo "real silicon: the bootloader reads an Android boot.img"
-		        echo "from the vendor 'boot' partition, and Linux roots on a"
-		        echo "UBI volume in /dev/mtd1. Right now this box is running"
-		        echo "from USB, SD or eMMC."
-		        echo
-		        echo "Run 'ws1508-nand-probe' to inspect or dump the flash."
-		        echo "Run 'ws1508-install-to-nand' to install the root"
-		        echo "filesystem -- read docs/flashing.md first, the kernel"
-		        echo "half needs the USB Burning Tool."
-		    else
-		        echo "There is no /dev/mtd0. Two possible reasons:"
-		        echo
-		        echo "  1. the running device tree leaves the NAND"
-		        echo "     controller disabled - the default, and the"
-		        echo "     likely one. To turn it on, add this to"
-		        echo "     /boot/armbianEnv.txt and reboot:"
-		        echo
-		        echo "         fdtfile=meson8b-ws1508-nand.dtb"
-		        echo
-		        echo "  2. it is enabled and nand_scan() did not manage to"
-		        echo "     enumerate the fitted die. That is a real"
-		        echo "     possibility: this driver has never run on"
-		        echo "     meson8b silicon. Check dmesg for meson-nand."
-		        echo
-		        echo "Read the notes beside that fdtfile line first: it is"
-		        echo "experimental and unvalidated, and the MTDs it gives"
-		        echo "you are read-only unless you also ask for writes."
-		        echo
-		        echo "Until then the root filesystem stays on USB or SD."
-		        echo "Flash ws1508-uboot.burn.img (bootloader only) and boot"
-		        echo "the system from a USB stick."
-		    fi
-		fi
-		echo
-		echo "--- current root ---"
-		findmnt -no SOURCE,FSTYPE,SIZE,USED /  2>/dev/null || df -h /
-		echo
-		echo "--- swap ---"
-		swapon --show 2>/dev/null || echo "(none)"
-	EOF
-	chmod +x /usr/local/sbin/ws1508-info
-
-	# The on-device eMMC installer: an alternative to flashing the full
-	# *.burn.img that writes a normal MBR itself, so it does not depend on
-	# how the Amlogic burning tool happens to lay partitions out. Shipped
-	# as a file in userpatches/overlay rather than inlined here, because it
-	# is long enough to want reviewing on its own.
-	if [ -r /tmp/overlay/ws1508-install-to-emmc ]; then
-		install -m 0755 /tmp/overlay/ws1508-install-to-emmc \
-			/usr/local/sbin/ws1508-install-to-emmc
-	fi
-
-	# Read-only diagnostics for the raw-NAND variant. Harmless to ship on
-	# an eMMC unit: it exits early when the running device tree is not the
-	# NAND one.
-	if [ -r /tmp/overlay/ws1508-nand-probe ]; then
-		install -m 0755 /tmp/overlay/ws1508-nand-probe \
-			/usr/local/sbin/ws1508-nand-probe
-	fi
-
-	# The on-device NAND installer. Writes only the UBI root filesystem;
-	# the kernel side goes into the vendor "boot" partition with the USB
-	# Burning Tool, because that partition is behind Amlogic's NFTL. Also
-	# harmless on an eMMC unit: it refuses to run unless the bootloader
-	# reported store=1 and the running device tree gave it an MTD
-	# partition labelled "ubi".
-	if [ -r /tmp/overlay/ws1508-install-to-nand ]; then
-		install -m 0755 /tmp/overlay/ws1508-install-to-nand \
-			/usr/local/sbin/ws1508-install-to-nand
-	fi
+	say "Setting up the login banner and initramfs modules"
 
 	# A UBIFS root has to be mountable before the root filesystem exists,
 	# so the modules have to be in the initramfs. Listing them here means
@@ -463,7 +331,7 @@ install_helper() {
 		echo "  Run 'ws1508-info' to see RAM, storage type and root device."
 		echo "  Booted from USB on an eMMC unit? 'ws1508-install-to-emmc'"
 		echo "  copies this system to the internal eMMC."
-		echo "  On a raw-NAND unit: 'ws1508-install-to-nand' (experimental)."
+		echo "  Updates, kernel included: apt update && apt full-upgrade"
 	EOF
 	if [ "${ROOT_PASSWORD_LOGIN}" = "yes" ] && [ -z "${SSH_KEY}" ]; then
 		cat >> /etc/update-motd.d/09-ws1508 <<-EOF
