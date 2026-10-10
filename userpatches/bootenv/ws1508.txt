@@ -57,10 +57,11 @@ console="both"
 #       384MiB, read-only, holding the bootloader, its environment, the
 #       per-unit keys and the partitions the bootloader reads) and
 #       /dev/mtd1 "ubi" (the rest, which Linux owns). That "if" is real:
-#       this driver has never run on meson8b silicon, so nand_scan()
-#       failing outright, or reads of vendor-written pages coming back
-#       ECC-uncorrectable, are both expected possibilities rather than
-#       bugs to report as regressions.
+#       the driver declines chips with pages larger than 4KiB, which
+#       includes the Hynix H27UBG8T2C found in these boxes (MLC, 8KiB
+#       pages -- and UBI refuses MLC in any case), and where it does
+#       attach, reads of vendor-written pages may come back
+#       ECC-uncorrectable. Both are expected, not regressions.
 #
 #   You need this line to INSTALL to NAND -- 'ws1508-install-to-nand'
 #   needs /dev/mtd1 to exist -- but not to BOOT from NAND. A box that has

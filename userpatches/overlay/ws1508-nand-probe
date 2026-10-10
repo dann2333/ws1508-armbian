@@ -15,9 +15,10 @@
 # erase, program, OOB write and mark-bad are refused below the vendor boot
 # region whatever you pass.
 #
-# The meson8b NAND support has never run on real S805 silicon. Everything
-# here exists to find out whether it works at all, not to put data on the
-# chip.
+# The meson8b NAND support has probed on S805 silicon, but whether it reads
+# vendor-written pages correctly is still unknown. Everything here exists
+# to find that out, not to put data on the chip. The driver's attach line
+# in dmesg carries the chip's full ID, which is what identifies the part.
 #
 # On its own this dtb does not make the box boot from NAND. The bootloader
 # can read the flash -- "store read <name> <addr> <off> <size>" dispatches

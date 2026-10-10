@@ -41,8 +41,9 @@
  *          carried by this repo: userpatches/kernel/archive/meson-6.12/
  *          ws1508-0100..0104-*.patch add meson8/meson8b to
  *          drivers/mtd/nand/raw/meson_nand.c. Opt-in (a separate dtb),
- *          read-only by default, and it has NEVER been run on real
- *          meson8b silicon.
+ *          read-only by default, and experimental: it probes on S805
+ *          silicon, but declines the MLC 8KiB-page part reported in a
+ *          WS1508, and its data path is unverified.
  *      (b) "the bootloader cannot read NAND". It can, through the vendor
  *          NFTL -- which is also why Linux cannot share a region with
  *          it: that layer ships only as a blob. The chip is split

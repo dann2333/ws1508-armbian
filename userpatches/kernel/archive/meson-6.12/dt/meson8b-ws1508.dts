@@ -400,8 +400,8 @@
  * A NAND unit that wants its flash visible boots meson8b-ws1508-nand.dtb
  * instead, which disables this node and enables the NAND controller on
  * the same pads. That is opt-in on purpose: it yields a read-only MTD for
- * inspection, not a bootable root, and the driver behind it has never run
- * on this silicon. See meson8b-ws1508-nand.dts.
+ * inspection, not a bootable root, and the driver behind it is still
+ * experimental on this silicon. See meson8b-ws1508-nand.dts.
  */
 &sdhc {
 	status = "okay";

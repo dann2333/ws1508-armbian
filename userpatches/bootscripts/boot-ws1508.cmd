@@ -121,8 +121,8 @@ setenv bootargs "${bootargs} ws1508.store=${ws1508_store}"
 #
 # in armbianEnv.txt. That is deliberately NOT selected automatically from
 # ${store}: enabling the NAND controller makes the kernel run nand_scan()
-# over the vendor flash with a driver that has never been exercised on
-# this silicon, and nobody should get that without asking for it.
+# over the vendor flash with a driver that is still experimental on this
+# silicon, and nobody should get that without asking for it.
 #
 # Selecting the NAND dtb here is NOT what makes the box boot from NAND,
 # and this script is not where that happens at all. Booting from internal

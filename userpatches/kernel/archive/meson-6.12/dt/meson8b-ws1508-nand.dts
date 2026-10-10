@@ -16,13 +16,15 @@
  *
  * READ THIS BEFORE USING IT:
  *
- *   - EXPERIMENTAL, AND UNTESTED ON HARDWARE. The meson8/meson8b support
- *     in drivers/mtd/nand/raw/meson_nand.c that this dtb switches on has
- *     never been run on real S805 silicon by anybody. It may not
- *     enumerate the chip at all (no /dev/mtd0), and if it does the reads
- *     may come back uncorrectable or silently wrong until the ECC
- *     strength and the scrambler settings are confirmed against a dump
- *     taken with the vendor bootloader.
+ *   - EXPERIMENTAL. The meson8/meson8b support in
+ *     drivers/mtd/nand/raw/meson_nand.c that this dtb switches on has
+ *     probed on S805 silicon, but its reads have never been checked
+ *     against the vendor's. The one WS1508 NAND chip reported so far
+ *     (a Hynix H27UBG8T2C, MLC with 8KiB pages) is declined outright, so
+ *     on such a unit there is no /dev/mtd0 at all -- and since that part
+ *     is MLC, UBI could not have used it anyway. Where the driver does
+ *     attach, reads may come back uncorrectable until the ECC strength
+ *     and scrambler settings are confirmed against a vendor dump.
  *
  *   - Selecting this dtb does not by itself make the box boot from
  *     internal storage; boot_nand in the u-boot environment is what

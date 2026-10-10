@@ -1,0 +1,66 @@
+Subject: mtd: rawnand: ids: add Hynix H27UBG8T2C by full ID
+
+The H27UBG8T2C (Hynix 20nm, 32Gbit MLC, ID ad d7 94 91 60 44) has 8KiB
+pages with 640 bytes of OOB in 2MiB erase blocks of 256 pages. Nothing in
+the ID tables matches it by full ID, so it falls through to the legacy
+0xd7 entry and hynix_nand_decode_id(), which reads byte 3 as a 4KiB page
+with 128 bytes of OOB in 512-page blocks.
+
+Every number in that is checkable from the code. Fed the six ID bytes,
+the non-JEDEC path of hynix_nand_decode_id() and its two helpers produce
+page 4096 (2048 << (0x91 & 3)), erase 2MiB (bit 7 set, (0x91 >> 4) & 3 ==
+1), OOB 128 (oobsize code 0) and an ECC requirement of 32b/1024B (level 6,
+technology 4, so 24 + 8 * (6 - 5)). The first field report of this part on
+a Meson8b board -- a Xunlei WS1508 -- printed exactly those four values:
+
+  nand: 4096 MiB, MLC, erase size: 2048 KiB, page size: 4096, OOB size: 128
+  nand: WARNING: d0048600.nand-controller: the ECC used on your system
+        (8b/1024B) is too weak compared to the one required by the NAND
+        chip (32b/1024B)
+
+The 8KiB/640 geometry is the one Amlogic's own NAND stack uses for this
+ID, which is what the box's factory firmware ran on: drivers/amlnf/phy/
+id_table.c in the vendor u-boot lists it as
+
+  {"C revision 20nm NAND 4GiB H27UBG8T2C",
+   {NAND_MFR_HYNIX, 0xd7, 0x94, 0x91, 0x60, 0x44},
+   8192, 4096, 0x200000, 640, ...}
+
+with the same 8192/640 in the older drivers/mtd/nand/aml_nand.c. The A
+(ad d7 94 9a 74 42) and B (ad d7 94 da 74 c3) revisions next to it in
+both tables already decode to 8KiB pages here and need no entry. The
+internal inconsistency of the mis-decode is a second witness: 32 bits of
+correction per 1KiB needs about 56 bytes of parity per step, i.e. 224 per
+4KiB page, which a 128-byte OOB cannot hold.
+
+The mis-decode is not cosmetic. With page_shift one too small, nand_base
+addresses erase block E as row E << 9, which the chip -- 256 pages per
+block -- reads as block 2E. Blocks below the middle of what the core
+believes is a 2048-block device therefore land on the even-numbered
+blocks of the whole chip, and from block 1024 upwards the row exceeds
+the chip's address space altogether. On the WS1508 report an ubiformat
+of the upper partition ran on into that range, and both erase failures
+it hit lie inside it, at blocks 1033 and 1046. A driver-side write guard
+that reasons in the decoded geometry cannot see any of this.
+
+The ECC requirement keeps the 32b/1024B the ID's own ECC field encodes
+under the decode nand_hynix.c already applies, which is also what
+Amlogic's older driver chose for this part (NAND_ECC_BCH16_MODE, 16 bits
+per 512 bytes). Scrambling is required, as the decode would also have
+set from the technology field.
+
+diff --git a/drivers/mtd/nand/raw/nand_ids.c b/drivers/mtd/nand/raw/nand_ids.c
+index 650351c..02367db 100644
+--- a/drivers/mtd/nand/raw/nand_ids.c
++++ b/drivers/mtd/nand/raw/nand_ids.c
+@@ -50,6 +50,10 @@ struct nand_flash_dev nand_flash_ids[] = {
+ 	{"SDTNRGAMA 64G 3.3V 8-bit",
+ 		{ .id = {0x45, 0xde, 0x94, 0x93, 0x76, 0x50} },
+ 		  SZ_16K, SZ_8K, SZ_4M, 0, 6, 1280, NAND_ECC_INFO(40, SZ_1K) },
++	{"H27UBG8T2CTR-BC 32G 3.3V 8-bit",
++		{ .id = {0xad, 0xd7, 0x94, 0x91, 0x60, 0x44} },
++		  SZ_8K, SZ_4K, SZ_2M, NAND_NEED_SCRAMBLING, 6, 640,
++		  NAND_ECC_INFO(32, SZ_1K) },
+ 	{"H27UCG8T2ATR-BC 64G 3.3V 8-bit",
+ 		{ .id = {0xad, 0xde, 0x94, 0xda, 0x74, 0xc4} },
+ 		  SZ_8K, SZ_8K, SZ_2M, NAND_NEED_SCRAMBLING, 6, 640,

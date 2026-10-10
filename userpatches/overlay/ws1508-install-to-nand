@@ -41,9 +41,22 @@
 # therefore disturb this filesystem, and re-flashing with "erase flash"
 # certainly destroys it.
 #
-# NONE OF THIS HAS RUN ON REAL HARDWARE. The meson8b raw-NAND driver
-# underneath it has never been exercised on S805 silicon. Everything below
-# is a first attempt, and the recovery path is a USB stick.
+# WHAT IS KNOWN FROM REAL HARDWARE (one WS1508, reported in issue #2):
+#
+#   - the driver probes and talks to the chip on S805 silicon;
+#   - that unit carries a Hynix H27UBG8T2C, which is MLC with 8KiB pages.
+#     UBI refuses to attach MLC NAND at all (drivers/mtd/ubi/build.c), and
+#     this driver cannot read 8KiB pages on the M8 family, so on that unit
+#     this script has nothing it can do.
+#
+# Kernels before the fix for that report mis-read the chip as 4KiB pages,
+# attached anyway, and with meson_nand.allow_write=1 let this script erase
+# blocks other than the ones it named. The checks below refuse an MLC part,
+# and refuse any MTD the driver has left read-only, BEFORE anything is
+# erased -- the driver now keeps the flash read-only whenever the ECC it
+# can fit falls short of what the chip asks for, which is how that
+# mis-read shows itself. No unit has yet completed an install, and the
+# recovery path is still a USB stick.
 
 set -euo pipefail
 
@@ -93,6 +106,23 @@ does not match what this script expects; refusing to guess which region is safe.
 MTD="/dev/mtd${MTD_UBI_NR}"
 [ -c "${MTD}" ] || die "${MTD} does not exist."
 
+MTD_SYS="/sys/class/mtd/mtd${MTD_UBI_NR}"
+MTD_TYPE="$(cat "${MTD_SYS}/type" 2>/dev/null || echo unknown)"
+MTD_FLAGS=$(( $(cat "${MTD_SYS}/flags" 2>/dev/null || echo 0) ))
+
+# UBI will not attach MLC NAND: ubi_attach_mtd_dev() refuses an
+# MTD_MLCNANDFLASH device unless it runs in SLC-emulation mode
+# (MTD_SLC_ON_MLC_EMULATION, 0x4000), which needs a partition marked
+# slc-mode and a pairing scheme this driver does not provide. Checking it
+# here, rather than letting ubiattach find out, is the difference between
+# refusing and erasing the whole partition first.
+if [ "${MTD_TYPE}" = "mlc-nand" ] && [ $(( MTD_FLAGS & 0x4000 )) -eq 0 ]; then
+	die "This unit's NAND is MLC, and UBI refuses to attach MLC flash.
+The internal-NAND root filesystem cannot work on it. Nothing has been
+erased. Keep running from the USB stick -- that is the supported setup
+for raw-NAND units. (The Hynix H27UBG8T2C reported on these boxes is MLC.)"
+fi
+
 STORE="$(tr ' ' '\n' < /proc/cmdline | sed -n 's/^ws1508\.store=//p' | head -1)"
 [ "${STORE}" = "1" ] || die "The bootloader reports store=${STORE:-unknown}, not 1 (raw NAND).
 Refusing to write the internal flash of a box whose own bootloader did not
@@ -103,6 +133,19 @@ if ! tr ' ' '\n' < /proc/cmdline | grep -qx 'meson_nand\.allow_write=1'; then
 this chip is read-only and nothing here can work. Add it to the extraargs=
 line in /boot/armbianEnv.txt and reboot. Read what that turns off first:
 docs/hardware.md."
+fi
+
+# 0x400 is MTD_WRITEABLE, and it is the ground truth: allow_write is only
+# one of the things that decide it. The driver also clears it, whatever
+# allow_write says, when the strongest ECC it can fit is weaker than the
+# chip requires -- which is also the visible symptom of a mis-decoded chip
+# geometry, the failure that made earlier kernels erase the wrong blocks.
+if [ $(( MTD_FLAGS & 0x400 )) -eq 0 ]; then
+	die "${MTD} is read-only even though meson_nand.allow_write=1 is set. The
+driver refuses writes when it cannot give this chip the ECC it requires,
+which can also mean the geometry it decoded is wrong. Look for the
+reason in:  dmesg | grep -i meson-nand
+Nothing has been erased."
 fi
 
 ROOTSRC="$(findmnt -no SOURCE /)"
@@ -154,8 +197,8 @@ cat <<EOF
   Currently running from: ${ROOTSRC}
   Root filesystem in use: ${USED_MIB}MiB
 
-  This driver has never run on real S805 silicon. If it goes wrong the box
-  still boots from USB, because u-boot tries USB before NAND.
+  No WS1508 has completed this install yet. If it goes wrong the box still
+  boots from USB, because u-boot tries USB before NAND.
 
 EOF
 read -r -p "  Type YES to continue: " answer

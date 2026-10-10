@@ -4,8 +4,10 @@
 #
 # The driver this turns on is the meson8/meson8b support added by the
 # ws1508-01xx-mtd-rawnand-* patches in
-# userpatches/kernel/archive/meson-6.12. It has never been run on real
-# S805 silicon.
+# userpatches/kernel/archive/meson-6.12. On S805 silicon it has probed and
+# read chip IDs on two boards (issues #1 and #2); its data path is still
+# unverified, and the one WS1508 NAND chip reported so far (a Hynix
+# H27UBG8T2C: MLC, 8KiB pages) is one it declines to drive.
 #
 # Nothing here changes what an eMMC unit does: the module only ever binds
 # if the running device tree has an enabled amlogic,meson8b-nfc node, and
@@ -125,5 +127,7 @@ function custom_kernel_config__ws1508_nand() {
 	#     MEMSETBADBLOCK path, which erases the block before marking it
 	#     and which "nandtest --markbad" issues after a refused erase.
 	#
-	# The write path has still never been exercised on real silicon.
+	# The write path is still unverified on real silicon. The driver also
+	# keeps everything read-only, allow_write or not, when the ECC it can
+	# fit is weaker than the chip requires (ws1508-0106).
 }

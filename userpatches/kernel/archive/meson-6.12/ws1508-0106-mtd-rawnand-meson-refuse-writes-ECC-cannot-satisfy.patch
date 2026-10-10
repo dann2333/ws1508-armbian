@@ -1,0 +1,148 @@
+Subject: mtd: rawnand: meson: refuse writes when the ECC cannot satisfy the chip, and log its full ID
+
+Follows the first two field reports of this port on Meson8b (S805)
+silicon. Both boards probed: the clocks, the pinmux, RESET and READ ID all
+came out right. What went wrong on the second one is the reason for this
+patch.
+
+That board, a Xunlei WS1508, carries a Hynix H27UBG8T2C -- 8KiB pages --
+which nand_base decoded as 4KiB pages with 128 bytes of OOB (fixed by full
+ID in the previous patch). With that geometry the driver attached, and its
+owner booted with meson_nand.allow_write=1 and ran ubiformat. Every row
+address the core sent then meant something else to the chip: erase block E
+became physical block 2E, and from the middle of the core's idea of the
+device upwards the rows ran past the end of the chip. The address guard
+from the write-protect patch could not object, because it reasons in the
+same wrong geometry; and nothing else stopped it, because allow_write is
+the user's switch and the user had thrown it.
+
+The one visible symptom was a warning nand_base already prints:
+
+  the ECC used on your system (8b/1024B) is too weak compared to the one
+  required by the NAND chip (32b/1024B)
+
+That is not a coincidence of this one part. A die whose page is
+under-reported has its OOB under-reported with it, so the strongest BCH
+that fits the reported OOB falls short of the requirement the same ID
+bytes encode. On this experimental family, take that warning as the
+refusal it should have been: if nand_ecc_is_strong_enough() fails, clear
+MTD_WRITEABLE regardless of allow_write, and say why. Two separate reasons
+make it correct even when the geometry is right -- data written with too
+weak an ECC does not survive on the part -- and neither reason is one a
+module parameter should be able to wave through.
+
+Only SoCs marked .experimental are affected, as with the rest of the
+guard; GXL and AXG behave exactly as before.
+
+Also print the full ID on the attach report line and in the "new OOB"
+refusal. nand_base logs only the manufacturer and device bytes, and on
+Hynix MLC parts the geometry comes from bytes 3 to 5: the WS1508 report
+could only be traced to a part number by reproducing the decode from the
+vendor's ID table, because the two bytes in the log fit three different
+chips.
+
+And replace the "not validated on silicon" note on meson8_data with what
+is now known: the probe path is, the data path is still not.
+
+diff --git a/drivers/mtd/nand/raw/meson_nand.c b/drivers/mtd/nand/raw/meson_nand.c
+index dc79c79..3d90ec2 100644
+--- a/drivers/mtd/nand/raw/meson_nand.c
++++ b/drivers/mtd/nand/raw/meson_nand.c
+@@ -1725,8 +1725,8 @@ static int meson_nand_attach_chip(struct nand_chip *nand)
+ 	 */
+ 	if (nfc->data->new_oob_over_4k && mtd->writesize > 4096) {
+ 		dev_err(nfc->dev,
+-			"%u byte page: the vendor wrote this chip in the M8 \"new OOB\" layout, which this driver does not implement\n",
+-			mtd->writesize);
++			"%u byte page (id %*ph): the vendor wrote this chip in the M8 \"new OOB\" layout, which this driver does not implement\n",
++			mtd->writesize, nand->id.len, nand->id.data);
+ 		return -EOPNOTSUPP;
+ 	}
+ 
+@@ -1806,13 +1806,19 @@ static int meson_nand_attach_chip(struct nand_chip *nand)
+ 	 * Everything a first bring-up on new silicon needs in order to decide
+ 	 * whether the clock, the pinmux and the ECC choice came out right, on
+ 	 * one line, so it can be read out of a boot log instead of a debugger.
++	 *
++	 * The full ID belongs on it too.  nand_base prints only the first two
++	 * bytes, and on Hynix MLC parts the geometry is decoded from bytes 3-5:
++	 * the first field report from a Meson8b board came from a die whose
++	 * page size that decode gets wrong by a factor of two, and the two
++	 * bytes in the log were not enough to tell which part it was.
+ 	 */
+ 	dev_info(nfc->dev,
+-		 "page %u oob %u erase %u ecc %d/%d bch %u scramble %d clk %lu Hz\n",
++		 "page %u oob %u erase %u ecc %d/%d bch %u scramble %d clk %lu Hz id %*ph\n",
+ 		 mtd->writesize, mtd->oobsize, mtd->erasesize,
+ 		 nand->ecc.size, nand->ecc.strength, meson_chip->bch_mode,
+ 		 !!(nand->options & NAND_NEED_SCRAMBLING),
+-		 clk_get_rate(nfc->nand_clk));
++		 clk_get_rate(nfc->nand_clk), nand->id.len, nand->id.data);
+ 
+ 	return ret;
+ }
+@@ -1934,11 +1940,41 @@ meson_nfc_nand_chip_init(struct device *dev,
+ 		meson_chip->orig_block_markbad = mtd->_block_markbad;
+ 		mtd->_block_markbad = meson_nfc_block_markbad_guard;
+ 
+-		if (!meson_nfc_allow_write) {
++		/*
++		 * An ECC weaker than the chip asks for is a reason to refuse
++		 * writes that allow_write must not be able to override, for
++		 * two reasons.  The obvious one: what this driver wrote would
++		 * not survive on the part.  The less obvious one is that the
++		 * mismatch is often the only visible symptom of a mis-decoded
++		 * ID.  A die whose page size nand_base under-reports also has
++		 * its OOB under-reported, so the strongest BCH that fits the
++		 * reported OOB falls short of the requirement the same ID
++		 * bytes encode -- and every row address this driver then sends
++		 * lands on a different physical page than it believes,
++		 * including rows past the end of the chip, which on a part
++		 * that ignores the excess address bits come round to the
++		 * vendor boot region.  The address guard reasons in the same
++		 * wrong geometry and cannot catch that.  This is not
++		 * hypothetical: it is what the first field report from a
++		 * Meson8b board (a Hynix H27UBG8T2C read as 4KiB pages instead
++		 * of 8KiB) ran into with allow_write=1.
++		 */
++		if (!nand_ecc_is_strong_enough(&nand->base)) {
++			const struct nand_ecc_props *req =
++				nanddev_get_ecc_requirements(&nand->base);
++
++			/* partitions inherit this, so it covers them too */
++			mtd->flags &= ~MTD_WRITEABLE;
++			dev_warn(dev,
++				 "%s: read-only whatever meson_nand.allow_write says: the chip requires %ub/%uB ECC but runs %db/%dB in %u OOB bytes, which can also mean the geometry decoded from id %*ph is wrong\n",
++				 mtd->name, req->strength, req->step_size,
++				 nand->ecc.strength, nand->ecc.size,
++				 mtd->oobsize, nand->id.len, nand->id.data);
++		} else if (!meson_nfc_allow_write) {
+ 			/* partitions inherit this, so it covers them too */
+ 			mtd->flags &= ~MTD_WRITEABLE;
+ 			dev_warn(dev,
+-				 "%s: read-only, this SoC's NAND port has never been validated on real silicon; boot with meson_nand.allow_write=1 to override\n",
++				 "%s: read-only, this SoC's NAND port has not been validated for writing on real silicon; boot with meson_nand.allow_write=1 to override\n",
+ 				 mtd->name);
+ 		}
+ 
+@@ -2047,10 +2083,16 @@ static const struct meson_nfc_data meson_axg_data = {
+  * SD_EMMC_C divider, a BCH60 boot mode instead of BCH8, an unconditional
+  * scrambler, and a "new OOB" page layout this driver does not implement.
+  *
+- * NOT VALIDATED ON SILICON.  The only reported bring-up on this family was an
+- * out-of-tree Meson8m2 attempt in 2019 that never landed, and no Meson8b board
+- * has ever had an NFC node.  Hence .experimental, which the write protection
+- * in the following patch keys off.
++ * PROBE VALIDATED ON SILICON, DATA PATH NOT.  Two Meson8b (S805) boards have
++ * run this: on both the controller clocks, the pinmux takes, and RESET and
++ * READ ID come back right, and on one of them erase and program completed at
++ * the command level as well.  Neither got further, for reasons that are not
++ * this driver's: one carried a 16KiB-page part (beyond NFC_CMD_RAW_LEN and in
++ * the "new OOB" layout), the other an 8KiB-page part that nand_base
++ * mis-decoded as 4KiB.  Nobody has yet checked a page this driver reads
++ * against what the vendor stack reads from the same page, so the ECC,
++ * scrambler and OOB handling remain unverified -- hence .experimental, which
++ * the write protection in the following patch keys off.
+  *
+  * There is deliberately no per-SoC NFC round-trip delay here.  The obvious
+  * candidate, NAND_CYCLE_DELAY, exists three times in Amlogic's own tree with
