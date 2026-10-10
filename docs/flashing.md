@@ -73,20 +73,12 @@ IP 从路由器的 DHCP 客户端列表里找，主机名是 `ws1508`。
 
 ## 二、NAND 版：刷引导 + U 盘跑系统
 
-这是 NAND 版的**推荐做法**，也是唯一在逻辑上没有未验证前提的做法：
-把引导刷进 NAND，系统跑在 U 盘上。想把系统也装进 NAND，
-见下面「二（进阶）」——那条路已经实现，但一次都没在实机上跑过。
+这是 NAND 版的**正式用法**：把引导刷进 NAND，系统跑在 U 盘上。
 
-> 为什么，说准一点：引导程序里**没有文件系统层**
-> （`CONFIG_NEXT_NAND` 让 Amlogic 的 Makefile 把 `libmtd.o` / `libnand.o`
-> 从构建里踢掉），所以 `fatload` 没法从 NAND 上的某个文件系统里读出 uImage。
-> 引导程序**能读 NAND**（`store read` / `amlnf read`，厂商 3.10 固件就是
-> 这么启动的），**但走的是厂商 NFTL，不是裸偏移** —— 那一层只有编译好的
-> 二进制，Linux 复现不了它的逻辑→物理映射。
-> 所以**不能**让引导程序和 Linux 共用同一块区域。
->
-> 绕开的办法是按物理位置切开芯片，这条路本项目**已经实现了**，
-> 见下面「装到内置 NAND（实验性）」。**一次都没在实机上跑过。**
+系统装不进内置 NAND。第一份 WS1508 NAND 版实测（issue #2）里的闪存是海力士
+**H27UBG8T2C**：MLC、8KB 页。UBI 拒绝挂载 MLC，主线驱动在 S805 上也读不了
+大于 4KB 的页，两条都是硬限制。见下面「二（进阶）」和
+[`hardware.md`](hardware.md) 里的实测数据。
 
 ### 1. 刷 U-Boot
 
@@ -115,9 +107,9 @@ IP 从路由器的 DHCP 客户端列表里找，主机名是 `ws1508`。
 >
 > 代价：擦除会一并抹掉一机一份的 `nkey` / `nsec`，**永久丢失**，
 > 本项目没有任何办法备份或恢复。`chipenv_init_erase_protect()` 里那道
-> 「保护 key 区」的判断在这个 U-Boot 里是空的，原因见下面「二（进阶）」
-> 那一节。跑 Armbian 用不到这些 key，但这不可逆 ——
-> 想留着回原厂固件可能性的人到此为止。详见「备份 / 恢复原厂」。
+> 「保护 key 区」的判断在这个 U-Boot 里是空的：它依赖的字段只在
+> `CONFIG_SECURITYKEY` 下才会被填，而这个宏没开。跑 Armbian 用不到这些 key，
+> 但这不可逆 —— 想留着回原厂固件可能性的人到此为止。详见「备份 / 恢复原厂」。
 >
 > eMMC 版不受这条影响（那边的表由 `mmc_device_init()` 直接重写一次记录，
 > 不会失败），但 eMMC 版走的是「一、」那条路，本来也不看这里。
@@ -144,120 +136,32 @@ sudo dd if=Armbian_*_ws1508_*.img of=/dev/sdX bs=4M status=progress conv=fsync
 
 ---
 
-## 二（进阶）、NAND 版：把系统装进内置 NAND
+## 二（进阶）、NAND 版：把系统装进内置 NAND —— 目前做不到
 
-> ⚠️ **一次都没在实机上跑过。** 底下那个 meson8b 裸 NAND 驱动
-> 从来没在 S805 芯片上运行过，这一节的每一步都建立在读代码而不是
-> 实测之上。做之前先把「救砖」那一节读完 —— 退路是 U 盘，
-> 而且 U-Boot 的启动顺序（USB → SD → eMMC → NAND）保证了
-> 插上 U 盘就一定能回来。
+本项目实现过一条「内置 NAND 启动」的路：芯片按物理位置切成两半，
+前 384MiB 归厂商引导栈（U-Boot 从里面的 `boot` 分区读一个 Android boot.img），
+后面归 Linux，用 UBI/UBIFS 做根文件系统。它建立在两个只有实机能确认的前提上：
+**芯片是 SLC**、**页不大于 4KB**。
 
-### 先理解这件事：芯片被切成两半
+第一份实测把两个前提都否定了：WS1508 NAND 版的闪存是海力士 **H27UBG8T2C**，
+MLC、8KB 页。
 
-厂商的 NFTL 只有编译好的二进制，Linux 复现不了它的逻辑→物理映射，
-所以两边不能共用同一块区域。物理上切开：
+- UBI 拒绝挂载 MLC（`drivers/mtd/ubi/build.c`），后半段没法做根文件系统；
+- 厂商代码对大于 4KB 的页使用控制器的「new OOB」布局，主线驱动没有实现，
+  所以现在的内核会直接拒绝挂载这颗芯片。
 
-| 物理范围 | 归谁 | 谁能写 |
-|---|---|---|
-| 0 – 384MiB | 厂商 `amlnf`（引导页、元数据、`nkey`/`nsec`、引导要读的 NFTL 分区） | 只有 USB 烧录工具 / U-Boot |
-| 384MiB – 末尾 | Linux（UBI + UBIFS 根） | 只有 Linux |
+所以这一节没有可执行的步骤了：NAND 安装包（`ws1508-nand.burn.img`）
+不再随 Release 发布，`ws1508-install-to-nand` 遇到 MLC 会在擦除前拒绝。
+代码留在仓库里，给万一存在的「SLC、页 ≤ 4KB」机器；
+`ws1508-info` 会显示你的芯片是 `nand`（SLC）还是 `mlc-nand`。
 
-**内核那一半 Linux 写不了，根文件系统那一半 U-Boot 读不了。**
-所以装机必然是两步，用两个不同的工具。
+> 🔴 **如果你在旧版本上跑过 `ws1508-install-to-nand`：** 旧内核把 H27UBG8T2C
+> 误认成 4KB 页，擦写命令落到的物理块和它以为的不一样，超出芯片的那部分地址
+> 还可能绕回芯片开头的厂商区。机器只要还能进 U-Boot、从 U 盘启动，就照常用；
+> 引导坏了就按上面「二、」重刷 `ws1508-uboot.burn.img`（勾「擦除 flash」）。
 
-### 1. 刷 `ws1508-nand.burn.img`（引导 + 内核）
-
-这个包 = 引导程序 + 一个 Android boot.img（里面是 uImage、裸 initrd、
-NAND 版 dtb），后者写进厂商 `boot` 分区。
-
-> 🔴 **第一次刷必须勾上「擦除 flash」（Erase flash）。**
->
-> 本项目改了分区表的 `mask_flags`（把 `resource` 和 `boot` 挪进
-> `nfcode`，否则 NFTL 那个 blob 在正常启动时根本不会给它们建设备，
-> `store read` / `imgread` 一个都用不了）。而
-> `amlnand_configs_confirm()`（`chipenv.c:1995`）会拿编译进去的表和
-> 芯片上存的那份逐字段比对，**对不上就直接失败**，只有烧录工具告诉它
-> 「这次要擦」时才放行。
->
-> 代价是：**擦除会一并抹掉一机一份的 `nkey` / `nsec`，永久丢失。**
-> 本项目没有任何办法备份或恢复它们（而且这个 U-Boot 里那道
-> 「保护 key 区不被擦」的判断是空的 —— 它依赖的字段只在
-> `CONFIG_SECURITYKEY` 下才会被填，而这个宏没开）。
-> 对跑 Armbian 的机器来说这些 key 没有用处，但这是不可逆的，
-> 想留着原厂固件可能性的人到此为止。
-
-### 2. 做启动 U 盘，从 U 盘启动
-
-和上面「二、」的第 2、3 步一样。
-
-### 3. 打开 NAND 设备树
-
-进系统后编辑 `/boot/armbianEnv.txt`，加两行：
-
-```
-fdtfile=meson8b-ws1508-nand.dtb
-extraargs=meson_nand.allow_write=1
-```
-
-重启，然后确认：
-
-```bash
-cat /proc/mtd          # 应该看到 mtd0 "vendor" 和 mtd1 "ubi"
-ws1508-nand-probe      # 打印几何、ECC、只读标志
-ws1508-nand-probe 1    # 同上，看 UBI 那个分区
-```
-
-**这一步就是实机验证点。** `ws1508-nand-probe` 的输出里有三件事决定
-后面能不能做：料是不是 SLC（UBI 不收 MLC）、页大小是不是 ≤4096、
-以及厂商写过的页读回来 ECC 有没有过。任何一条不对，就停在这里。
-
-### 4. 装根文件系统
-
-```bash
-sudo ws1508-install-to-nand
-```
-
-它会检查 `store=1`、`allow_write=1`、两个分区标签都在，然后
-`ubiformat` → `ubimkvol` → 挂上 → `rsync` 整个系统过去，
-并且写好 `/etc/fstab` 和 initramfs 模块列表。
-`/dev/mtd0`（前 384MiB）在设备树里就是只读的，不会被碰。
-
-### 5. 拔掉 U 盘，开机
-
-```
-Try to boot from USB...Fail
-Try to boot from SD...Fail
-Try to boot from eMMC...Fail
-Try to boot from NAND...
-## ANDROID Format IMAGE
-```
-
-看到最后两行就说明 `imgread` 读到了。**不拔 U 盘就还是从 U 盘启动** ——
-这既是注意事项，也是退路。
-
-### 注意：以后再进烧录工具，都可能动到根文件系统
-
-两件事，程度不同：
-
-- **勾了擦除 = 一定没了。** `store erase data` 在 NAND 上是连着擦
-  `data`、`code`、`cache` 三个设备的（`common/store_interface.c:220-241`），
-  烧录工具的擦除档位走的就是这条路。UBI 根文件系统和内核都会被抹掉，
-  第 4 步要重做。
-- **不勾擦除 = 说不准。** 正常启动时 U-Boot 用 flag=0 调
-  `amlnf_logic_init()`，那条路会跳过 `nfdata`，所以 Linux 那一半从不被碰
-  —— 这正是这个设计成立的前提。但**烧录会话用的是非 0 的 flag**，
-  那时 `nfdata` 会被挂上 NFTL。挂载本身会不会写，在 blob 里面，看不到。
-
-所以：装完之后尽量别再进烧录工具。真要更新内核，见下面。
-
-### 内核更新怎么办
-
-`apt upgrade` 升级内核**不会**更新 NAND 里的那一份：它在 NFTL 后面，
-Linux 写不了。要更新就重新生成 `ws1508-nand.burn.img` 再刷一次
-（这次不用勾擦除，分区表没变）。或者在 U-Boot 命令行里用
-`usb_update boot ws1508-nand-boot.andr` 从 U 盘写。
-
-这是这条路的真实代价，权衡之后再决定要不要走。
+真正能让这类盒子从内置 NAND 跑主线系统的路，是把厂商 `amlnf` 驱动连同
+NFTL 二进制移植到新内核（RK3229 上有先例），目前没有人做。
 
 ---
 
@@ -313,10 +217,11 @@ USB → SD 卡 → eMMC → NAND
 - 插上一个做好的启动 U 盘 → 优先从 U 盘启动
   （**这是救砖通道**：内置系统搞坏了，插个 U 盘就能进去修，不用拆机）；
 - 插的是普通数据 U 盘（找不到 `boot.scr`）→ 自动跳过，继续往下试；
-- 前面三档都没有，且 `${store}` 报的是裸 NAND → 从内置 NAND 启动。
-  这一档**不经过 `boot.scr`**（`boot.scr` 自己就得从文件系统里读，
-  NAND 上没有），整条逻辑在 U-Boot 环境变量 `boot_nand` 里。
-  它排在最后，所以插着 U 盘永远优先 U 盘 —— NAND 装挂了也回得来。
+- 前面三档都没有，且 `${store}` 报的是裸 NAND → 尝试从内置 NAND 启动。
+  这一档**不经过 `boot.scr`**，整条逻辑在 U-Boot 环境变量 `boot_nand` 里；
+  NAND 的 `boot` 分区里没有内核时（目前所有 NAND 版机器都是这样，见上面
+  「二（进阶）」）它读不到东西，打一行 `Fail` 就结束。排在最后，所以插着 U 盘
+  永远优先 U 盘。
 
 > SD 卡那一档基本用不上：**WS1508 相比一代砍掉了 TF 卡槽**，绝大多数机器
 > 根本没有卡槽（设备树里的 SD 节点是从玩客云继承来的）。留着这一档只是
@@ -400,10 +305,11 @@ dd if=/dev/mmcblk1 of=/mnt/backup/ws1508-emmc.img bs=4M status=progress
 
 ### NAND 版：能做的只有诊断样本，**没有**可用的原厂备份路径
 
-NAND 版没有块设备。实验性的 NAND 设备树**如果**能认出这颗芯片，
+NAND 版没有块设备。实验性的 NAND 设备树**如果**驱动肯接这颗芯片，
 会给出一个 `/dev/mtd0`（在 `/boot/armbianEnv.txt` 里加
-`fdtfile=meson8b-ws1508-nand.dtb` 重启）——「如果」是认真的，这个驱动
-从来没在 meson8b 芯片上跑过，`nand_scan()` 枚举不出来是预期结果之一。
+`fdtfile=meson8b-ws1508-nand.dtb` 重启）——「如果」是认真的：已知的
+WS1508 NAND 芯片海力士 H27UBG8T2C 是 8KB 页，驱动会直接拒绝它
+（`dmesg | grep -i meson-nand` 里能看到原因和芯片完整 ID），那就没有 `/dev/mtd0`。
 真出来了，`ws1508-nand-probe` 能从它 dump 一段出来：
 
 ```bash
@@ -428,8 +334,10 @@ sudo nanddump --bb=dumpbad \
 - `nanddump` 不加 `--omitoob` / `--noecc` 时**不含 OOB**，
   而厂商保留区的元数据就在 OOB 里；
 - 本项目**没有任何**能把这块区域写回去的路径 ——
-  驱动会挡掉落在厂商引导区里的擦写请求，加 `meson_nand.allow_write=1` 也不放行
-  （这道保护和这部分的其它一切一样，没有在实机上验证过）。
+  驱动会挡掉落在厂商引导区里的擦写请求，加 `meson_nand.allow_write=1` 也不放行。
+  注意这道保护是按驱动算出的芯片几何来判断地址的：几何认错时它会失效，
+  这正是 issue #2 里发生的事（现在的内核已能正确识别那颗芯片，
+  并且在 ECC 对不上时整体只读）。
 
 所以 `nkey` / `nsec` 的正确说法是：**本项目救不回来，也没有提供备份手段。**
 真要备份它，只能在厂商 U-Boot 的命令行上用 `amlnf` / `store` 命令去读
@@ -464,10 +372,9 @@ sudo nanddump --bb=dumpbad \
    第一次开机要扩展根分区、重新生成 SSH 主机密钥，这机器慢。
 2. **蓝灯不闪、红灯常亮** = 通电正常但系统没起来。插一张做好的启动 U 盘再通电：
    - **能起来**（路由器里能看到 `ws1508` 拿到 IP）→ U-Boot 是好的。SSH 进去跑
-     `ws1508-info`：如果它说 `raw NAND`，那内置存储里要么还没装系统
-     （这就是刚刷完引导的正常状态），要么装了但没起来 —— 想装进内置 NAND
-     见上面「二（进阶）」，那条路没在实机上验证过；如果说 `eMMC`，
-     那是内置存储里那份系统坏了，跑 `sudo ws1508-install-to-emmc`
+     `ws1508-info`：如果它说 `raw NAND`，那就是正常状态 —— NAND 版的系统
+     本来就跑在 U 盘上（内置 NAND 装不了系统，见上面「二（进阶）」）；
+     如果说 `eMMC`，那是内置存储里那份系统坏了，跑 `sudo ws1508-install-to-emmc`
      重装一遍即可。
    - **插 U 盘也起不来** → 问题在 U-Boot。接双公头 USB 线通电，重刷
      `ws1508-uboot.burn.img`（不用按 RESET，见上面「再次刷机不用再按 RESET」）。
@@ -480,12 +387,13 @@ sudo nanddump --bb=dumpbad \
 - 正常，启动顺序是 USB 优先。拔掉 U 盘就会从 eMMC 启动
 
 **NAND 版刷了完整 `.burn.img`（eMMC 那个）会怎样**
-- 引导能刷进去，但那个包里的 `boot` 是一个 FAT 分区镜像，
-  **会盖掉 NAND 里的内核**（正确的内容是 `ws1508-nand.burn.img` 里那个
-  Android boot.img）。`rootfs` 那个是 ext4 镜像，经 NFTL 写下去 Linux
-  永远读不回来，纯属白写 —— 而且它落在 UBI 根文件系统所在的物理区域。
-- 所以 NAND 版**不要**刷 eMMC 的完整包。只装引导用
-  `ws1508-uboot.burn.img`；连内核一起装用 `ws1508-nand.burn.img`。
+- 引导能刷进去，但那个包里的 `boot` 和 `rootfs` 是 FAT / ext4 分区镜像，
+  经厂商 NFTL 写进 NAND 之后 Linux 读不回来，纯属白写，还多磨损一遍闪存。
+- 所以 NAND 版**不要**刷 eMMC 的完整包，只刷 `ws1508-uboot.burn.img`。
+
+**已经装好的机器怎么升级**
+- 不用重刷，用 `apt`：见 [`upgrading.md`](upgrading.md)。
+  老镜像先跑一次 `ws1508-apt-setup.sh`，之后就是 `apt update && apt full-upgrade`。
 
 **`reboot` 之后起不来，要拔电重启**
 - 这是 S805 这批盒子的老毛病（看门狗 / 电源状态没复位），社区普遍反馈过。

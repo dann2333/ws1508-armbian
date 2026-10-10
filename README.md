@@ -5,13 +5,14 @@
 由 GitHub Actions 全自动编译，**开机自启 SSH**。
 
 - **eMMC 版机器**：可以直刷内置存储，拔掉 U 盘照样开机。
-- **NAND 版机器**：可以直刷引导（U-Boot），也可以把整个系统装进内置 NAND
-  —— 但那条路一次都没在实机上验证过，见下面「NAND 版：从内置 NAND 启动」。
+- **NAND 版机器**：直刷引导（U-Boot），系统跑在 U 盘上。
+  内置 NAND 装不了系统 —— 实测芯片是 MLC，见下面「NAND 版：内置 NAND 的现状」。
+- **已经装好的机器**：用 `apt` 升级，内核和设备树一起更新，**不用重刷**，
+  见 [`docs/upgrading.md`](docs/upgrading.md)。
 
 > WS1508 同时存在 **NAND** 和 **eMMC** 两种版本（连同一块 v1.1 主板都有两种），
-> 本项目对两种都做了适配。eMMC 那条路是常规做法；
-> NAND 那条路要绕开一个没有源码的厂商 FTL，
-> 见下面「NAND 版：从内置 NAND 启动」。
+> 本项目对两种都做了适配：eMMC 版可以完全跑在内置存储上，
+> NAND 版用本项目的引导从 U 盘启动。
 
 ---
 
@@ -51,9 +52,9 @@
 
 | 你的机器 | 下载文件 | 刷入方式 | 结果 |
 |---|---|---|---|
-| **eMMC 版** | `Armbian_*_ws1508_*.burn.img` | Amlogic USB Burning Tool | ✅ 直刷内置存储，完全脱离 U 盘 |
+| **eMMC 版** | `Armbian-*.burn.img` | Amlogic USB Burning Tool | ✅ 直刷内置存储，完全脱离 U 盘 |
 | **NAND 版** | `ws1508-uboot.burn.img` | Amlogic USB Burning Tool | ⚠️ 只刷引导，系统在 U 盘上 |
-| **先试试看** | `Armbian_*_ws1508_*.img.xz` | 解压后写入 U 盘 / SD 卡 | 不动内置存储 |
+| **先试试看** | `Armbian-*.img.xz` | 解压后写入 U 盘 / SD 卡 | 不动内置存储 |
 
 > 🔴 **NAND 版第一次刷本项目的引导，必须在烧录工具里勾上「擦除 flash」**
 > —— `ws1508-uboot.burn.img` 也一样。本项目改了 NAND 分区表，不勾擦除时
@@ -66,6 +67,22 @@
 eMMC 版还有一条**更稳妥的备选路线**：只刷 `ws1508-uboot.burn.img`，
 U 盘启动后 SSH 进去跑 `ws1508-install-to-emmc`，由它自己在 eMMC 上写标准
 MBR 并把系统装进去。不依赖烧录工具的分区行为，失败了插回 U 盘就复原。
+
+### 已经装好了？用 apt 升级，不用重刷
+
+```bash
+curl -fLO https://github.com/dann2333/ws1508-armbian/releases/latest/download/ws1508-apt-setup.sh
+sudo bash ws1508-apt-setup.sh      # 只需一次：开启更新通道，并把内核升到最新
+sudo reboot
+```
+
+之后就是普通的 `apt update && apt full-upgrade`。这一版起刷的新镜像已经自带更新通道。
+
+> ⚠️ **之前发布的所有镜像都建议尽快跑一次上面的脚本**（不想升级就用
+> `sudo bash ws1508-apt-setup.sh pin`）。Armbian 官方源里有和本项目内核同名、
+> 但不带 WS1508 设备树的包；Armbian 发布 26.11.1 之后，老镜像上一次普通的
+> `apt upgrade` 就会装上它，机器随即无法启动。原因和细节见
+> [`docs/upgrading.md`](docs/upgrading.md)。
 
 ### 首次登录
 
@@ -103,126 +120,58 @@ ssh root@<设备IP>        # 也可以试 ssh root@ws1508.local
 
 ---
 
-## NAND 版：从内置 NAND 启动
+## NAND 版：内置 NAND 的现状
 
-**已经实现了，但一次都没在实机上跑过。** 这一节讲它是怎么做到的，
-因为要用它就得知道它靠什么假设成立。
+**结论：NAND 版用本项目的引导从 U 盘启动，这就是正式用法。内置 NAND 装不了系统。**
 
-### 关键事实：这颗芯片有两个互相读不懂对方的主人
+第一份来自真实 WS1508 NAND 版的报告（[issue #2](../../issues/2)）给出了芯片：
+海力士 **H27UBG8T2C**（ID `ad d7 94 91 60 44`），32Gbit **MLC**，
+**8KB 页** + 640 字节 OOB，2MB 擦除块。这一颗芯片同时卡死了两条路：
 
-厂商的 `amlnf` 栈用的是一层页级 FTL（NFTL），做磨损均衡和坏块重映射，
-映射表存在页的 OOB 里。而这一层**只有编译好的二进制**
-（`drivers/amlnf/logic/libamlnf_logic_150311.z`，一个 ARM ELF 目标文件），
-没有源码。所以「逻辑偏移」和「物理偏移」不是一回事，
-Linux 永远没法复现这个映射。
+- **UBI 拒绝挂载 MLC NAND**（`drivers/mtd/ubi/build.c`）。
+  本项目原本的设计是 Linux 用 UBI/UBIFS 占芯片后半段做根文件系统，在 MLC 上这条路不存在。
+- **主线 `meson_nand` 在 S805 上读不了大于 4KB 的页**：厂商代码给这种芯片用的是
+  控制器的「new OOB」布局，驱动没实现，所以会直接拒绝挂载。
 
-结论：**不能让两边共享同一块区域**。于是按物理位置把芯片切成两半：
+另一台 S805 盒子（MXQ，[issue #1](../../issues/1)）上的数据是同一个结论：
+那台是 16KB 页的 SanDisk MLC。这一代电视盒子用的基本都是大页 MLC。
+两份报告也确认了驱动本身在 S805 上**能跑**：时钟、引脚复用、复位和读 ID 都对。
 
-| 物理范围 | 归谁 | 内容 |
-|---|---|---|
-| 0 – 384MiB | 厂商 `amlnf` | 掩膜 ROM 读的 1024 个启动页；48 个好块的元数据窗口（坏块表、U-Boot 环境、一机一份的 `nkey`/`nsec`）；引导程序要读的 NFTL 分区 |
-| 384MiB – 末尾 | Linux | UBI，上面一个 UBIFS 卷做根文件系统 |
+### 这次修掉的问题
 
-384MiB 这个边界不是拍脑袋：启动页占 2MiB，元数据窗口 6MiB，
-`nfcode`（`resource` 4MiB + `boot` 256MiB，NFTL 还要多留 1/8）约 292MiB，
-加起来约 300MiB。384 是留足坏块余量后取整。4GiB 的芯片上这点浪费换的是
-唯一一类改不回来的错误不会发生。
+旧内核会把 H27UBG8T2C **误认成 4KB 页**（主线的海力士 ID 解码对这颗 20nm 料算错了，
+页大小和 OOB 都只算出一半，正好绕过了上面那道「大于 4KB 就拒绝」的检查）。
+驱动于是带着错误的几何参数挂载上去；如果再加了 `meson_nand.allow_write=1`
+并运行安装脚本，擦写命令会落到**另外的物理块**上，地址超出芯片的部分还可能绕回芯片开头，
+也就是厂商引导和元数据所在的位置。驱动自带的写保护是按同一套错误参数算的，拦不住。
 
-**Linux 那一半为什么是安全的**：它落在 `amlnf` 的 `nfdata` 设备里，
-而 NFTL 那个 blob 的 `amlnf_logic_init()` 在 flag=0 时会跳过 `nfdata` ——
-每次正常启动 U-Boot 都正是这么调的（`arch/arm/lib/board.c:750`）。
-所以厂商那边的垃圾回收和磨损均衡从来不会碰这块地方。
+现在：
 
-### 启动怎么走
+- 内核按完整 ID 正确识别这颗芯片（8KB 页），驱动随即拒绝挂载，不会再有可写的 MTD；
+- 芯片要求的 ECC 强度这个控制器满足不了时（误识别的典型症状），驱动一律只读，
+  `allow_write=1` 也不放行；
+- `ws1508-install-to-nand` 在擦除任何东西之前就拒绝 MLC 芯片和只读的 MTD；
+- 驱动的挂载日志会打印芯片完整 ID，方便以后定位型号。
 
-不经过 `boot.scr`。`boot.scr` 自己就是 `fatload` 出来的，而 NAND 上没有
-文件系统可读，纯 NAND 的机器根本走不到那一步。所以整条路放在 U-Boot
-环境变量里，`CONFIG_BOOTCOMMAND` 在 USB / SD / eMMC 都失败之后才跑它：
+**如果你在旧版本上跑过 `ws1508-install-to-nand`：** 内置 NAND 的厂商区可能被写坏了一部分。
+机器只要还能正常进 U-Boot 从 U 盘启动，就不影响使用；如果引导坏了，
+按 [`docs/flashing.md`](docs/flashing.md) 用 USB Burning Tool（勾「擦除 flash」）重刷引导即可。
 
-```
-imgread kernel boot 0x16000000 && bootm 0x16000000
-```
+### 那「从内置 NAND 启动」的代码呢
 
-`imgread kernel` 从厂商 `boot` 分区里读一个 **Android boot.img**，
-读多少由镜像头自己说了算（`common/cmd_imgread.c:328`）。
-然后一条 `bootm` 把三样东西全从这一个镜像里取出来
-（`common/cmd_bootm.c:294-320`）：
+U-Boot 里的 `boot_nand`、`scripts/make-nand-image.sh`、`ws1508-install-to-nand`
+都还在仓库里，留给万一存在的「SLC、页不大于 4KB」的机器，
+但 NAND 安装包已经不再随 Release 发布。真正能让这类盒子从内置 NAND 跑主线系统的路，
+是把厂商的 `amlnf` 驱动连同 NFTL 二进制移植到新内核（RK3229 上有人这样做成过，
+见 issue #1），目前没有人做。设计细节和来龙去脉见 [`docs/hardware.md`](docs/hardware.md)
+和 [`docs/development.md`](docs/development.md)。
 
-- **内核**：`+0x800` 处的 legacy uImage（`bootm` 这个 `0x800` 是写死的，
-  所以页大小必须正好 2048）
-- **initrd**：按 `ramdisk_size` 原样交给内核 —— 所以这一格放的是**裸的
-  `initrd.img`**，不是 mkimage 包过的 `uInitrd`
-- **设备树**：按 `second_size` 取，经过 `get_multi_dt_entry()`，
-  普通 dtb 原样返回（`common/aml_dt.c:29-32`）
+### 为什么社区的直刷包说「只支持 eMMC」
 
-这个 boot.img 由 `scripts/make-nand-image.sh` 生成，
-头是自己写的，不依赖 `mkbootimg`。
-
-### 装机步骤
-
-见 [docs/flashing.md](docs/flashing.md)。两半分开装，因为**内核那一半
-Linux 写不了**（在 NFTL 后面），根文件系统那一半又只有 Linux 能写：
-
-1. 用 USB 烧录工具刷 `ws1508-nand.burn.img`（引导程序 + 内核）。
-   第一次刷**必须勾上「擦除 flash」**，因为分区表变了 —— 代价是
-   `nkey`/`nsec` 永久丢失，先读 docs/flashing.md 里那一段。
-2. 从 U 盘启动，`armbianEnv.txt` 里加 `fdtfile=meson8b-ws1508-nand.dtb`
-   和 `extraargs=meson_nand.allow_write=1`，重启。
-3. 跑 `ws1508-install-to-nand`，它把根文件系统写成 UBI 卷。
-4. 关机、**拔掉 U 盘**、开机。
-
-拔 U 盘这一步不是可选的：U-Boot 的顺序是 USB → SD → eMMC → NAND，
-插着 U 盘就一直从 U 盘启动。反过来说，这也就是出了问题时的退路。
-
-### 还没验证的地方
-
-整条路都没在实机上跑过，其中这几条是硬前提，只有实机能确认：
-
-- 那颗料必须是 **SLC**。UBI 拒绝挂 `MTD_MLCNANDFLASH`
-  （`drivers/mtd/ubi/build.c:898`）。
-- 页大小必须 **≤ 4096**，否则驱动直接不 attach。
-- 驱动的 ECC/加扰设置得真能读回厂商写过的页。
-
-`ws1508-nand-probe` 打印的就是这几项。
-
-### 内核这边：有一个实验性的驱动
-
-本项目给主线的 `drivers/mtd/nand/raw/meson_nand.c` 打了补丁，把
-meson8/meson8b 加了进去（原本只认 `amlogic,meson-gxl-nfc` 和
-`amlogic,meson-axg-nfc`）。默认**不启用**；在 `/boot/armbianEnv.txt` 里加
-`fdtfile=meson8b-ws1508-nand.dtb` 重启之后，**如果驱动认得出这颗芯片**，
-NAND 版机器上会出现两个 MTD：`/dev/mtd0`（`vendor`，前 384MiB，设备树里
-写死只读）和 `/dev/mtd1`（`ubi`，剩下的）。两个默认都不可写 ——
-要写还得再加 `meson_nand.allow_write=1`。
-
-在 eMMC 版机器上误加这一行不会把机器搞死：启动脚本会拿 U-Boot 自己探测到的
-`${store}` 卡一道，不是裸 NAND 就打一行提示、退回 eMMC 设备树继续启动。
-
-「如果」两个字是认真的：主线 meson-nand **从来没有在 meson8b 芯片上跑过**，
-本项目也没有实机。预期之内的结果包括：`nand_scan()` 根本枚举不出芯片、
-压根没有 `/dev/mtd0`；或者出来了，但读厂商写过的页全是 ECC 纠不回来。
-在 ECC 强度和加扰器设置被确认对得上之前，后一种是**预期结果**，不是驱动坏了。
-
-它有两个用处：一是把内置闪存**读**出来，看驱动读得对不对；二是装系统 ——
-`ws1508-install-to-nand` 需要 `/dev/mtd1` 才能跑。默认关闭、默认只读，
-`vendor` 那个分区连加了 `allow_write=1` 也还是只读，
-驱动另外还会挡掉落在厂商引导区里的擦写请求
-（这些保护同样没在实机上验证过）。
-细节、已知的未知、以及开之前该做什么，见
-[`docs/hardware.md`](docs/hardware.md) 的「裸 NAND：能做什么、不能做什么」。
-
-这也是为什么社区里现有的 WS1508 直刷包普遍写着「只支持 emmc 的，nand 的刷不了」：
-它们用的是玩客云的 U-Boot，而玩客云是纯 eMMC 机器，
-那份 U-Boot **没有开 `CONFIG_CMD_NAND`**，
-于是 `get_device_boot_flag()` 压根不会去探测 NAND，NAND 机器自然启动不了。
-本项目的 U-Boot 打开了这个选项，NAND 和 eMMC 两种机器都能识别、都能刷。
-
-NAND 版把系统装进内置存储并从那里启动，本项目**已经实现了**，
-见上面「NAND 版：从内置 NAND 启动」和
-[`docs/flashing.md`](docs/flashing.md) 的「二（进阶）」。
-但它一次都没在实机上验证过。想要一条已经有人跑通的路，
-那就是厂商 3.10 内核的老固件（社区有 Debian 10 的 NAND 直刷包）——
-代价是和主线内核 / 新版 Debian / Docker 互斥。
+它们用的是玩客云的 U-Boot，而玩客云是纯 eMMC 机器，那份 U-Boot **没有开
+`CONFIG_CMD_NAND`**，于是 `get_device_boot_flag()` 压根不会去探测 NAND，
+NAND 机器自然启动不了。本项目的 U-Boot 打开了这个选项，
+NAND 和 eMMC 两种机器都能识别、都能刷、都能从 U 盘启动。
 
 ---
 
@@ -251,11 +200,12 @@ NAND 版把系统装进内置存储并从那里启动，本项目**已经实现�
 1. Fork 本仓库；
 2. Actions → **Build WS1508 Armbian** → **Run workflow**；
 3. 可选参数：
-   - `release`：`bookworm`(Debian 12) / `trixie`(Debian 13) / `noble`(Ubuntu 24.04)
+   - `release`：`trixie`(Debian 13，默认) / `bookworm`(Debian 12) / `noble`(Ubuntu 24.04) / `resolute`(Ubuntu 26.04)
    - `build_type`：`minimal`（推荐）/ `cli`
    - `root_password`：默认 root 密码
    - `ssh_authorized_key`：直接塞一把 SSH 公钥进去
-4. 跑完在 Releases / Artifacts 里下载。
+4. 跑完在 Releases / Artifacts 里下载。手动触发且勾了 `publish_release` 的构建会发布 Release，
+   同时也发布这一版的 apt 仓库（见 [`docs/upgrading.md`](docs/upgrading.md)）。
 
 ### 本地编译
 
@@ -265,7 +215,7 @@ NAND 版把系统装进内置存储并从那里启动，本项目**已经实现�
 # u-boot 用的是厂商自带的 32 位 x86 工具链，所以要开 i386 multiarch
 sudo dpkg --add-architecture i386
 sudo apt-get update
-sudo apt-get install -y build-essential git curl xz-utils python3 \
+sudo apt-get install -y build-essential git curl xz-utils python3 apt-utils \
     android-sdk-libsparse-utils device-tree-compiler \
     libc6:i386 zlib1g:i386 libstdc++6:i386
 
@@ -275,6 +225,7 @@ cd ws1508-armbian
 bash scripts/build-uboot.sh                    # 引导（约 3 分钟）
 sudo -E bash scripts/build-armbian.sh build    # Armbian 镜像（较慢）
 sudo -E bash scripts/make-burn-image.sh        # 打包直刷镜像
+sudo -E bash scripts/make-apt-repo.sh          # 可选：把内核 / 板级包排成 apt 仓库
 ```
 
 产物在 `output/` 下。
@@ -300,17 +251,29 @@ userpatches/
                               （DMA info 缓冲区定尺 / SoC 支持 / 厂商区写保护）
     ws1508-0103-*.patch       dt-bindings: amlogic,meson-nand.yaml 加两个 compatible
     ws1508-0104-*.patch       arch/arm/boot/dts/amlogic/meson8b.dtsi 加 NFC 节点和引脚
+    ws1508-0105-*.patch       nand_ids.c 按完整 ID 收录海力士 H27UBG8T2C（主线把它误认成 4KB 页）
+    ws1508-0106-*.patch       ECC 满足不了芯片要求时强制只读；日志打印芯片完整 ID
   extensions/ws1508-nand.sh   打开 MTD / 裸 NAND 的内核配置
                               （编译时带 WS1508_NAND_SLUB_DEBUG=yes 可加 SLUB 调试）
+  extensions/ws1508-bsp.sh    把 ws1508-* 工具放进板级支持包，写 apt pin，给镜像开更新通道
   customize-image.sh          SSH 自启 + 512MB 调优
+  overlay/ws1508-info         报告机器型号、存储类型、更新通道状态
+  overlay/ws1508-apt-setup    开启 / 修复 apt 更新通道和 pin（老设备从 Release 下载 .sh 版）
   overlay/ws1508-install-to-emmc  在机器上把系统装进 eMMC（自己写 MBR）
+  overlay/ws1508-install-to-nand  装进内置 NAND（实验性；MLC 芯片会直接拒绝）
   overlay/ws1508-nand-probe   裸 NAND 只读诊断 / dump 工具
 scripts/
-  common.sh                   共用配置（上游仓库均已固定 commit）
+  common.sh                   共用配置（U-Boot 固定 commit；Armbian 跟最新 main）
   build-uboot.sh              编译 U-Boot 并打包引导刷机包
-  build-armbian.sh            调用 armbian/build 编译镜像
+  build-armbian.sh            调用 armbian/build 编译镜像（给每次构建的包打上递增版本号）
   make-burn-image.sh          合成完整直刷镜像
+  make-apt-repo.sh            把内核 / 设备树 / 板级包排成 apt 仓库，随 Release 发布
+  make-nand-image.sh          NAND 内核包（实验性，只作为构建产物，不随 Release 发布）
 docs/
+  flashing.md                 刷机、救砖
+  upgrading.md                不重刷的 apt 升级
+  hardware.md                 硬件细节、NAND / eMMC 分辨、串口
+  development.md              开发笔记、已验证 / 未验证的东西
 ```
 
 ---

@@ -256,6 +256,8 @@ DRAM 基址是 `0x00000000`，不是设备树里写的 `0x40000000`：
 |---|---|
 | `build-uboot.sh` | 编出来的 U-Boot 里同时有 `try nand boot` 和 `try emmc boot`；NAND 探测顺序补丁在位 |
 | `build-armbian.sh` | 镜像 boot 分区里有 `dtb/meson8b-ws1508.dtb`、`boot.scr` 和 `uInitrd`（启动脚本无条件加载 uInitrd，缺了就起不来）；另外有 `dtb/meson8b-ws1508-nand.dtb`，且至少一个 `linux-image-*.deb` 里带 `meson_nand.ko` |
+| `build-armbian.sh` | 板级支持包里有 5 个 `ws1508-*` 工具、postinst 会写 apt pin、包版本等于这次的 `REVISION`；镜像根分区里有更新通道的源文件、pin 和 `/usr/sbin/ws1508-apt-setup`，且没有会挡住它们的 `/usr/local/sbin/ws1508-info` |
+| `make-apt-repo.sh` | 内核、设备树、板级包都在；每个包的版本都带 `.ws1508.<时间戳>`；文件名不会被 GitHub 改写 |
 | `make-burn-image.sh` | 打好的 burn 包能被 AmlImg 原样解回来，且 5 个必需成员齐全 |
 
 后两项是 NAND 变体加的。它是**运行期 opt-in** 的：设备树或驱动悄无声息地
@@ -281,6 +283,52 @@ DRAM 基址是 `0x00000000`，不是设备树里写的 `0x40000000`：
 > 没有哪个 `linux-image-*.deb` 带 `meson_nand.ko` 也会 `die`。
 > 意图仍然对不上——警告说会降级，检查说不许降级——净效果是 fail safe，
 > 只是报错信息指向缺失的 dtb / 扩展，不是版本变更本身。
+
+---
+
+## 包版本与 apt 更新通道
+
+装好的机器靠 `apt` 升级（用户文档见 [`upgrading.md`](upgrading.md)），
+这件事依赖几个不太显眼的机制，改动相关代码前先读这一节。
+
+**版本号必须单调递增。** Armbian 给它构建的所有包打同一个版本号 `REVISION`，
+默认取 Armbian 仓库的 `VERSION` 文件 —— `26.11.0-trunk` 这种，几个月不变。
+两次内容不同的构建版本号一样，apt 就永远不会认为有更新。
+`build-armbian.sh` 因此在后面追加构建时间：`26.11.0-trunk.ws1508.<UTC 时间戳>`，
+CI 传入的时间戳和 Release 标签是同一个时刻。用 `dpkg --compare-versions` 核对过：
+
+- 比之前所有镜像里的 `26.11.0-trunk` 大；比更早的时间戳大；跨 Armbian `VERSION`
+  升级（如到 `27.2.0-trunk`）仍然递增；
+- 板级支持包依赖 `base-files (>= REVISION)`，老镜像里的
+  `26.11.0-trunk-13.x-trixie` 仍然满足（`-` 之前的上游部分更大）。
+
+`make-apt-repo.sh` 拒绝不带 `.ws1508.` 后缀的包，所以绕过 `build-armbian.sh`
+的构建发不出一个「看起来正常、其实什么都不更新」的仓库。
+
+**仓库就是 Release 附件。** 每个 Release 带一份完整的平铺仓库
+（`Packages`、`Packages.gz`、`Release`、内核 / 设备树 / 头文件 / 板级包），
+机器上的源指向 `releases/latest/download/`。GitHub 对这个路径下的任何文件名
+先 302 到最新 Release 的同名地址，存在就再 302 到资产服务器，不存在就 404 ——
+apt 先要的 `InRelease`、`Release.gpg` 正好是 404，按 `Trusted: yes` 继续。
+所以发布时必须 `make_latest: true`，资产文件名必须只含 `[A-Za-z0-9._-]`
+（否则 GitHub 会改名，和索引里的 `Filename` 对不上）。
+
+**pin 比源更重要。** Armbian 官方源有同名的 `linux-image-current-meson` /
+`linux-dtb-current-meson`，不带 WS1508 设备树。`/etc/apt/preferences.d/ws1508`
+按 `Origin: Armbian` 把它们定成 -1。在沙箱 apt 里验证过：没有 pin 时一个
+`26.11.1` 的官方包会成为候选；有 pin 时真实 apt.armbian.com 上的各版本全是 -1。
+
+**谁在什么时候写什么。** `ws1508-apt-setup` 是 pin 和源文件内容的唯一来源：
+
+- pin：板级支持包的 postinst 每次安装 / 升级都写（镜像构建时也会跑到）；
+- 源：镜像构建最后的 `post_post_debootstrap_tweaks` 钩子写入，晚于 Armbian
+  在构建里做的最后一次 `apt-get update`。放进板级包会让构建中途就去拉本项目的
+  仓库，在最新 Release 还没有索引时直接失败；
+- 老设备：从 Release 下载 `ws1508-apt-setup.sh` 跑一次。
+
+postinst 里的函数体是被 `declare -f` 摘出来直接贴进脚本顶层的
+（`artifact_package_hook_helper_board_side_functions`），所以里面不能用 `local`，
+也不要用 heredoc。
 
 ---
 
@@ -358,29 +406,44 @@ eMMC 版刷完 `.burn.img`、拔掉 U 盘、通电，等 2 分钟：
   这样也不用赌到底哪个是对的；
 - eMMC 的 `max-frequency = <200000000>` 和 `mmc-hs200-1_8v` 沿用社区设备树。
   如果实机 eMMC 不稳定，先把这两项降下来试；
-- 完整 `.burn.img` 在 NAND 版机器上的行为。这条在 NAND 启动做出来之后
-  变了：`boot` 现在装的是 NAND 内核，被 eMMC 那个包里的 FAT 分区镜像盖掉
-  就不再是「白写」而是破坏；`rootfs` 那个 ext4 落在 UBI 的物理区域上。
-  而且不勾擦除时它根本刷不进去（`store init 1` 过不了分区表校验）。
-  预期行为见 flashing.md 的 FAQ —— **NAND 版不要刷这个包**。
+- 完整 `.burn.img` 在 NAND 版机器上的行为。不勾擦除时它根本刷不进去
+  （`store init 1` 过不了分区表校验）；勾了擦除，`boot` / `rootfs` 两个分区镜像
+  经 NFTL 写进去，Linux 读不回来，纯属白写。见 flashing.md 的 FAQ ——
+  **NAND 版不要刷这个包**。
 
-### meson8b 裸 NAND 驱动：树里目前最大的一块没验证过的东西
+### meson8b 裸 NAND 驱动：现在知道了什么、还不知道什么
 
 单独列一节，因为它比上面几条加起来都大。涉及的文件：
 
 ```
-userpatches/kernel/archive/meson-6.12/ws1508-0100..0104-*.patch
+userpatches/kernel/archive/meson-6.12/ws1508-0100..0106-*.patch
 userpatches/kernel/archive/meson-6.12/dt/meson8b-ws1508-nand.dts
 userpatches/extensions/ws1508-nand.sh
 userpatches/overlay/ws1508-nand-probe
+userpatches/overlay/ws1508-install-to-nand
 ```
 
-具体不知道的是：
+**两份用户报告之后已经知道的：**
 
-- **主线 `meson_nand.c` 从来没有在 meson8b 芯片上跑过。** 2019 年唯一一次尝试
-  是在 Meson8m2 上，而且没进主线。所以「`nand_scan()` 到底能不能枚举出
-  这颗芯片」本身就是未知数 —— 枚举不出来、压根没有 `/dev/mtd0`，
-  是预期结果之一，不是回归。
+- 驱动在 S805 上**能跑**：issue #1（MXQ，SanDisk 16KB 页 MLC）和 issue #2
+  （WS1508）上时钟、引脚复用、复位、读 ID 都正确，WS1508 那台上擦写命令也执行成功。
+- WS1508 NAND 版的闪存是海力士 **H27UBG8T2C**：MLC、8KB 页、640 字节 OOB
+  （ID `ad d7 94 91 60 44`，厂商 `amlnf/phy/id_table.c` 的 C revision 条目）。
+  UBI 不收 MLC，驱动不支持 M8 的「new OOB」大页布局 —— 这颗芯片上
+  内置 NAND 的根文件系统这条路不存在。
+- 主线 `nand_hynix.c` 把这颗芯片解码成 4KB 页 / 128 OOB（把 ID 原样喂进
+  `hynix_nand_decode_id()` 的逐行转写能复现报告里的全部四个数）。
+  这个误识别绕过了驱动「页大于 4KB 就拒绝」的检查，也让厂商区写保护失效：
+  内核按 4KB 页算的行地址，芯片按 8KB 页理解，擦除块 E 实际落在 2E，
+  一半以上的地址越过芯片末尾。用户在 `allow_write=1` 下跑了安装脚本，
+  擦写就落在了这些位置上。`ws1508-0105` 按完整 ID 修正识别，
+  `ws1508-0106` 在 ECC 满足不了芯片要求时（误识别的典型症状）一律只读，
+  `ws1508-install-to-nand` 擦除前先拒绝 MLC 和只读 MTD。
+
+**还不知道的：**
+
+- 驱动读回厂商写过的页对不对 —— 没人拿驱动读出来的页和厂商栈读的同一页比过。
+  在「SLC、页 ≤4KB」的芯片上才有机会验证，目前没见过这样的 WS1508。
 - **中断号是未知的，所以设备树里根本没写。** `ws1508-0104` 加进
   `meson8b.dtsi` 的 nfc 节点没有 `interrupts` 属性：没有任何主线、
   非主线或厂商设备树给过这个控制器一个 GIC 号，厂商 m8 驱动无条件
@@ -414,17 +477,14 @@ userpatches/overlay/ws1508-nand-probe
   那是第一个该看的地方（也是 `WS1508_NAND_SLUB_DEBUG=yes` 存在的理由）。
 - 厂商引导区写保护的边界按芯片**自报**的页/块大小算（前 1024 页 + 64 个块），
   几何认小了它就跟着缩水。`ws1508-0102` 为此加了
-  `MESON8_VENDOR_MIN_BYTES = 16MiB` 的下限并取较大值，所以边界**不会**
-  缩到 16MiB 以下——这一条已经有对策，别再当成敞着的风险。
-  仍然未知的是这个下限够不够：它只保证盖住 4×256 个引导页，
-  厂商保留区是按**好块**计数的，坏块多的机器上尾巴会往上浮，
-  盖不盖得住要实机数据说了算。
-- 从内置 NAND 启动这条路**已经实现，但没在实机上试过**。它靠的是把芯片
-  按物理位置切开：厂商 NFTL（一个没有源码的 blob）拿前 384MiB，Linux 拿
-  剩下的做 UBI。之所以安全，是因为 Linux 那一半落在 `nfdata` 设备里，
-  而 blob 的 `amlnf_logic_init()` 在 flag=0 时会跳过它 —— 每次正常启动
-  U-Boot 都正是这么调的。这条依据来自对 blob 的反汇编，不是文档，
-  所以它是整条路里最该在实机上复核的一个假设。
+  `MESON8_VENDOR_MIN_BYTES = 16MiB` 的下限并取较大值。issue #2 说明这只能算
+  第二层：页大小认错时每个地址都指向别处，高处的地址还会绕回芯片开头，
+  下限管不到。主防线是 `ws1508-0106` 的 ECC 检查。
+- 从内置 NAND 启动这条路（芯片按物理位置切开：厂商 NFTL 拿前 384MiB，
+  Linux 拿剩下的做 UBI；依据是 blob 的 `amlnf_logic_init()` 在 flag=0 时
+  跳过 `nfdata`）代码还在，但在已知芯片上走不通，NAND 安装包也不再随 Release
+  发布。能让这类盒子从内置 NAND 跑主线系统的路，是把厂商 `amlnf` 连同 NFTL
+  blob 移植到新内核（issue #1 里提到 RK3229 上的先例），目前没人做。
 
 这就是为什么这部分**默认关闭、默认只读**，而且需要用户在
 `armbianEnv.txt` 里手动加一行才生效。

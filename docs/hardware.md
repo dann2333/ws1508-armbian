@@ -124,8 +124,8 @@ cat /proc/cmdline | tr ' ' '\n' | grep ws1508.store
 
 主线的 `drivers/mtd/nand/raw/meson_nand.c` 原本只认 `amlogic,meson-gxl-nfc`
 和 `amlogic,meson-axg-nfc`。本项目在
-`userpatches/kernel/archive/meson-6.12/` 下带了 **5 个**补丁
-（`ws1508-0100` 到 `ws1508-0104`），把 meson8/meson8b 加了进去：
+`userpatches/kernel/archive/meson-6.12/` 下带了 **7 个**补丁
+（`ws1508-0100` 到 `ws1508-0106`），把 meson8/meson8b 加了进去：
 寄存器映射和命令编码和 GXL 完全一样，差别在时钟树、启动页的 BCH 码、
 加扰器和一个会越界的 DMA。
 
@@ -136,9 +136,11 @@ cat /proc/cmdline | tr ' ' '\n' | grep ws1508.store
 | `0102` | `meson_nand.c`：厂商引导区写保护（单独一个补丁，免得被顺手丢掉） |
 | `0103` | `Documentation/devicetree/bindings/mtd/amlogic,meson-nand.yaml` |
 | `0104` | `arch/arm/boot/dts/amlogic/meson8b.dtsi`：NFC 节点和 nand 引脚组 |
+| `0105` | `nand_ids.c`：按完整 ID 收录海力士 H27UBG8T2C（主线的解码把它算成 4KB 页） |
+| `0106` | `meson_nand.c`：ECC 满足不了芯片要求时一律只读；日志打印芯片完整 ID |
 
-审查或 rebase 的时候请数够 5 个 —— 尤其是 `0102`，
-它是 `meson_nand.allow_write=1` 和厂商引导区之间唯一的东西。
+审查或 rebase 的时候请数够 7 个 —— 尤其是 `0102` 和 `0106`，
+它们是 `meson_nand.allow_write=1` 和厂商引导区之间仅有的东西。
 
 ### 先说清楚：引导程序怎么读 NAND，以及为什么两边不能共用区域
 
@@ -163,21 +165,16 @@ cat /proc/cmdline | tr ' ' '\n' | grep ws1508.store
   映射表存在页的 OOB 里，所以 Linux 永远算不出它的逻辑→物理映射。
   **两边不能共用同一块区域。**
 
-**从内置 NAND 启动现在实现了**，办法是按物理位置把芯片切开：厂商栈拿
-前 384MiB（引导页 + 元数据窗口 + 它要读的 NFTL 分区），Linux 拿剩下的
-做 UBI。引导程序用 `imgread kernel boot` 从厂商 `boot` 分区读一个
-Android boot.img，一条 `bootm` 就把内核、initrd、dtb 全取出来；
-Linux 则在 `/dev/mtd1` 上挂 UBIFS 根。整条路写在 U-Boot 环境变量
-`boot_nand` 里，不经过 `boot.scr`（`boot.scr` 自己就得从文件系统里读，
-纯 NAND 机器走不到）。
+本项目为此做过一条「从内置 NAND 启动」的路：按物理位置把芯片切开，
+厂商栈拿前 384MiB（引导页 + 元数据窗口 + 它要读的 NFTL 分区），Linux 拿剩下的
+做 UBI；引导程序用 `imgread kernel boot` 从厂商 `boot` 分区读 Android boot.img，
+写在 U-Boot 环境变量 `boot_nand` 里。**这条路在已知的 WS1508 NAND 芯片上走不通**：
+它要求芯片是 SLC、页不大于 4KB，而实测的海力士 H27UBG8T2C 是 MLC、8KB 页
+（见下面「闪存是哪颗：实测结果」）。代码留着，但 NAND 安装包已不再随 Release 发布。
 
-细节见 README「NAND 版：从内置 NAND 启动」，装机步骤见
-[flashing.md](flashing.md)。**一次都没在实机上跑过。**
-
-内核这边**期望**给出两个 MTD：`/dev/mtd0`（`vendor`，前 384MiB，
-设备树里就写死只读）和 `/dev/mtd1`（`ubi`，剩下的，UBI 根文件系统装在
-这里）。写「期望」是因为这个驱动从来没在 meson8b 芯片上跑过 —— 见下面
-「已知没验证过的地方」。
+内核这边，驱动肯接芯片时会给出两个 MTD：`/dev/mtd0`（`vendor`，前 384MiB，
+设备树里就写死只读）和 `/dev/mtd1`（`ubi`，剩下的）。在 H27UBG8T2C 上驱动会拒绝，
+两个都不会出现。
 
 ### 怎么开
 
@@ -228,17 +225,19 @@ SD 卡槽在 `&sdio` 上，不受影响。
 边界取两个值里大的那个：按芯片自己上报的页/块大小算出来的
 「前 1024 页 + 64 个块」，和一个写死的 **16MiB 下限**
 （`MESON8_VENDOR_MIN_BYTES`，见 `ws1508-0102-*.patch`）。
-这道保护本身**没有在实机上验证过**。
+另外，芯片要求的 ECC 强度这个控制器满足不了时，整个 MTD 一律只读，
+`allow_write=1` 也不放行（`ws1508-0106`）。地址闸是按驱动认出的几何算的，
+几何认错时它会失效 —— issue #2 就是这样，所以 ECC 这一道才是主防线。
 
 > ⚠️ 镜像里装了 `mtd-utils`（`ws1508-nand-probe` 要用它的 `nanddump`）。
 > Debian / Ubuntu 是一个合并的包，所以 `flash_erase`、`nandwrite`、
 > `nandtest`、`ubiformat` 也一并装进来了。`MTD_UBI` 现在是开的
 > （`MTD_UBI=m`，NAND 根文件系统要用），不过就算不开也挡不住
 > `ubiformat` —— 它是直接对 `/dev/mtdN` 发 `MEMERASE` / `MEMWRITE`。
-> **别把这些工具指向 `/dev/mtd0`。** 拦着它们的只有驱动里那两道：
+> **别把这些工具指向 `/dev/mtd0`。** 拦着它们的只有驱动里那几道：
 > 不加 `meson_nand.allow_write=1` 时整个 MTD 是只读的，
-> 以及厂商引导区那道无论如何都不放行的地址闸。
-> 两道都没在实机上验证过。要读就只用 `nanddump`。
+> ECC 对不上时无论如何都只读，以及厂商引导区那道地址闸
+> （几何认错时会失效，见下面「已知没验证过的地方」）。要读就只用 `nanddump`。
 
 ### 开之前
 
@@ -288,26 +287,50 @@ SD 卡槽在 `&sdio` 上，不受影响。
   内核**任何**莫名其妙的 oops（哪怕调用栈里和 NAND 毫无关系）
   都先按 DMA 越界处理并反馈，别当成不相干的问题排查。
 
-### 闪存到底是哪颗，未知
+### 闪存是哪颗：实测结果
 
-NAND 版上那颗芯片印的是迅雷自己的料号（例如 `WS1508CRA10L`），
-查不到规格。想知道真实型号，在 U-Boot 命令行里跑：
+NAND 版上那颗芯片印的是迅雷自己的料号（例如 `WS1508CRA10L`），查不到规格。
+第一份实测（[issue #2](https://github.com/dann2333/ws1508-armbian/issues/2)）的 dmesg
+加上厂商驱动里的芯片表，把它定位到了：
 
+| 项目 | 值 |
+|---|---|
+| 型号 | 海力士 **H27UBG8T2C**（20nm，Amlogic 表里写作「C revision 20nm NAND 4GiB」） |
+| ID | `ad d7 94 91 60 44` |
+| 容量 / 类型 | 32Gbit（4GiB），**MLC** |
+| 页 / OOB | **8192** 字节 / 640 字节 |
+| 擦除块 | 2MiB = 256 页 |
+| ECC 要求 | 芯片 ID 里编码的是 32bit/1KB |
+
+依据：厂商 u-boot 的 `drivers/amlnf/phy/id_table.c` 对这个 ID 记的就是
+8192/640/2MiB，盒子出厂固件就是在这套参数上跑的。主线的海力士 ID 解码
+（`nand_hynix.c` 的 `hynix_nand_decode_id()`）对这颗 20nm 料算错：
+把它的六个 ID 字节原样喂进去，得到的是页 4096、OOB 128、块 2048KiB、
+ECC 32b/1024B —— 和报告里的 dmesg **四个数一模一样**。同一张表里的 A 版
+（`ad d7 94 9a 74 42`）和 B 版（`ad d7 94 da 74 c3`）主线都算得对，只有 C 版错。
+`ws1508-0105` 按完整 ID 把它收进了 `nand_ids.c`。
+
+另一台 S805 盒子（MXQ，[issue #1](https://github.com/dann2333/ws1508-armbian/issues/1)）
+上是 SanDisk SDTNRGAMA：64Gbit MLC，16KB 页 + 1280 字节 OOB。
+这一代盒子用的基本都是大页 MLC。
+
+**以后想知道自己这颗是什么**，不用串口了：驱动挂载时打的那行（或者拒绝时的那行）
+现在带芯片完整 ID：
+
+```bash
+dmesg | grep -i meson-nand
 ```
-amlnf chipinfo
-```
 
-本项目的 U-Boot 保留了 `amlnf` 命令（`drivers/amlnf/dev/cmd_amlnf.c`）。
-**这一步需要串口**——它是全文里少数几个真的绕不过串口的场合之一。
-不想接串口的话，也可以直接看驱动 attach 时打印的那行，信息基本够用，
-只是拿不到厂商料号。
+`ws1508-info` 也会显示 MTD 类型是 `nand`（SLC）还是 `mlc-nand`。
+用串口在 U-Boot 里跑 `amlnf chipinfo` 也行（本项目的 U-Boot 保留了 `amlnf` 命令），
+能看到厂商那边的料号。
 
 几何参数一出来，有三个判断可以立刻做——驱动在 attach 时会打印一行
-`page ... oob ... erase ... ecc ... bch ... clk ...`，照着看：
+`page ... oob ... erase ... ecc ... bch ... clk ... id ...`，照着看：
 
 | 看到什么 | 结论 |
 |---|---|
-| `page` > 4096 | 厂商是用 `AML_NAND_NEW_OOB` 模式写的，主线驱动复现不了这种排布 |
+| `page` > 4096 | 厂商是用 `AML_NAND_NEW_OOB` 模式写的，主线驱动复现不了这种排布，会拒绝挂载（H27UBG8T2C 就是这种） |
 | `page` + `oob` > 16383 | `meson_nand_attach_chip()` 直接拒绝，raw 模式一次传不完一页 |
 | `oob` 大小 | 决定能选多强的 ECC：厂商的规则是 `oobsize / 步数 >= ecc_bytes + 2` |
 
@@ -317,13 +340,20 @@ amlnf chipinfo
 ### 已知没验证过的地方
 
 这一节是整个 NAND 部分里最重要的一节。**本项目没有 WS1508 实机**，
-下面每一条都没有在真芯片上跑过。
+现在有的是两份用户报告（issue #1、#2）。
 
-- 主线 meson-nand **从来没有**在 meson8b 芯片上跑过。2019 年唯一一次尝试
-  是在 Meson8m2 上，而且没进主线。
-- **可能根本没有 `/dev/mtd0`。** `nand_scan()` 有可能枚举不出这颗芯片
-  （时钟、引脚复用、R/B 等待、DMA 任何一环不对都会），
-  那样开了设备树也什么都不会出现。这不是「回归」，是还没验证过的东西没跑通。
+- **已经确认的：** 驱动在 S805 芯片上能跑起来。两台机器上时钟、引脚复用、
+  复位、读 ID 都正确；WS1508 那台上擦除和写入命令也都在命令层面执行成功了
+  （可惜是在错误的几何参数下，见下一条）。
+- **几何认错会让写保护失效，这一条已经实际发生过。** 旧内核把 H27UBG8T2C
+  认成 4KB 页，驱动就带着错的参数挂了上去；用户加了 `meson_nand.allow_write=1`
+  跑安装脚本，擦写命令落到了别的物理块上，超出芯片的地址还可能绕回芯片开头。
+  厂商区写保护是按同一套错误参数算地址的，拦不住。现在的对策是两道：
+  `0105` 让这颗芯片被正确识别（随即被拒绝），`0106` 在「芯片要求的 ECC 强度
+  这个控制器在报出来的 OOB 里放不下」时一律只读 —— 页大小报小了，OOB 也会跟着
+  报小，这个矛盾就是误识别最常见的外在症状。
+- **没有 `/dev/mtd0` 是正常结果之一。** 页大于 4KB 的芯片驱动会拒绝，
+  `dmesg | grep -i meson-nand` 会说明原因并打印芯片 ID。
 - **就算出来了，读到的内容也可能是错的。** 厂商写过的页用硬件 ECC 读回来
   纠不动，是 ECC 强度 / 加扰器设置还没对上的**预期结果**，
   不能直接当成「闪存坏了」。设备树里 ECC 故意没写死，就是等实机数据。
@@ -353,10 +383,10 @@ amlnf chipinfo
   真在 M8 硅片上撞到 slab 破坏，这里是第一个该看的地方。
 - 厂商引导区写保护的边界按芯片**自报**的页/块大小算（前 1024 页 + 64 个块），
   几何认小了它就会跟着缩水 —— 所以 `ws1508-0102` 给它加了
-  `MESON8_VENDOR_MIN_BYTES = 16MiB` 的下限，取两者的较大值，
-  再怎么认错也不会缩到 16MiB 以下。这一条现在**是有对策的**，
-  不再是敞着的风险；剩下的未知是这个下限够不够 —— 它只保证盖住
-  4×256 个引导页，盖不盖得住随坏块上浮的厂商保留区尾巴，还要实机数据。
+  `MESON8_VENDOR_MIN_BYTES = 16MiB` 的下限。但 issue #2 说明这还不够：
+  页大小认错时，问题不只是边界缩水，而是**每一个地址都指向别的物理位置**，
+  高处的地址还会绕回芯片开头。所以真正的防线是 `0106` 的「ECC 对不上就只读」，
+  这道下限只是第二层。
 
 ---
 
@@ -439,7 +469,7 @@ amlnf chipinfo
 | 网口 | ✅ `dwmac-meson`，RMII 100M |
 | USB | ✅ `dwc2`，含 USB 存储 |
 | SD / eMMC | ✅ `meson-mx-sdio` / `meson-mx-sdhc` |
-| 裸 NAND | ⚠️ **实验性且未在实机验证**，本项目自带补丁把 meson8/meson8b 加进 `meson_nand.c`；默认关闭、默认只读。从它启动的路径**已经实现**（引导端 `imgread kernel boot` 读 Android boot.img，Linux 侧 UBI/UBIFS 根），同样未在实机验证。见上文「裸 NAND：能做什么、不能做什么」 |
+| 裸 NAND | ⚠️ **实验性**。本项目自带补丁把 meson8/meson8b 加进 `meson_nand.c`，在 S805 实机上能探测到芯片；默认关闭、默认只读。已知的 WS1508 NAND 芯片（海力士 H27UBG8T2C，MLC、8KB 页）驱动会拒绝，UBI 也不收 MLC，所以**装不了系统**。见上文「裸 NAND：能做什么、不能做什么」 |
 | HDMI | — 内核有 `drm/meson`，但**这块板子没有视频输出**，用不上 |
 | 温度传感 | ⚠️ meson8b 支持有限 |
 | GPU (Mali-450) | ⚠️ lima 驱动，对这机器没什么意义 |
